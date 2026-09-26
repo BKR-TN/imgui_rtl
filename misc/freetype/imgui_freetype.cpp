@@ -221,9 +221,8 @@ void ImGui_ImplFreeType_FontSrcData::CloseFont()
     }
 }
 
-static const FT_Glyph_Metrics* ImGui_ImplFreeType_LoadGlyph(ImGui_ImplFreeType_FontSrcData* src_data, uint32_t codepoint)
+static const FT_Glyph_Metrics* ImGui_ImplFreeType_LoadGlyphIndex(ImGui_ImplFreeType_FontSrcData* src_data, uint32_t glyph_index)
 {
-    uint32_t glyph_index = FT_Get_Char_Index(src_data->FtFace, codepoint);
     if (glyph_index == 0)
         return nullptr;
 
@@ -486,12 +485,9 @@ static void ImGui_ImplFreeType_FontBakedDestroy(ImFontAtlas* atlas, ImFontConfig
     bd_baked_data->~ImGui_ImplFreeType_FontSrcBakedData(); // ~IM_PLACEMENT_DELETE()
 }
 
-static bool ImGui_ImplFreeType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, ImWchar codepoint, ImFontGlyph* out_glyph, float* out_advance_x)
+static bool ImGui_ImplFreeType_FontBakedLoadGlyphIndex(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, uint32_t glyph_index, ImFontGlyph* out_glyph, float* out_advance_x)
 {
     ImGui_ImplFreeType_FontSrcData* bd_font_data = (ImGui_ImplFreeType_FontSrcData*)src->FontLoaderData;
-    uint32_t glyph_index = FT_Get_Char_Index(bd_font_data->FtFace, codepoint);
-    if (glyph_index == 0)
-        return false;
 
     if (bd_font_data->BakedLastActivated != baked) // <-- could use id
     {
@@ -501,7 +497,7 @@ static bool ImGui_ImplFreeType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConf
         bd_font_data->BakedLastActivated = baked;
     }
 
-    const FT_Glyph_Metrics* metrics = ImGui_ImplFreeType_LoadGlyph(bd_font_data, codepoint);
+    const FT_Glyph_Metrics* metrics = ImGui_ImplFreeType_LoadGlyphIndex(bd_font_data, glyph_index);
     if (metrics == nullptr)
         return false;
 
@@ -530,7 +526,7 @@ static bool ImGui_ImplFreeType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConf
     const bool is_visible = (w != 0 && h != 0);
 
     // Prepare glyph
-    out_glyph->Codepoint = codepoint;
+    out_glyph->GlyphId = glyph_index;
     out_glyph->AdvanceX = advance_x;
 
     // Pack and retrieve position inside texture atlas
@@ -573,6 +569,22 @@ static bool ImGui_ImplFreeType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConf
     return true;
 }
 
+static bool ImGui_ImplFreeType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, ImWchar codepoint, ImFontGlyph* out_glyph, float* out_advance_x)
+{
+    ImGui_ImplFreeType_FontSrcData* bd_font_data = (ImGui_ImplFreeType_FontSrcData*)src->FontLoaderData;
+    uint32_t glyph_index = FT_Get_Char_Index(bd_font_data->FtFace, codepoint);
+    if (glyph_index == 0)
+        return false;
+    return ImGui_ImplFreeType_FontBakedLoadGlyphIndex(atlas, src, baked, loader_data_for_baked_src, glyph_index, out_glyph, out_advance_x);
+}
+
+static bool ImGui_ImplFreeType_FontBakedLoadGlyphByIndex(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, unsigned int glyph_index, ImFontGlyph* out_glyph, float* out_advance_x)
+{
+    if (glyph_index == 0)
+        return false;
+    return ImGui_ImplFreeType_FontBakedLoadGlyphIndex(atlas, src, baked, loader_data_for_baked_src, (uint32_t)glyph_index, out_glyph, out_advance_x);
+}
+
 static bool ImGui_ImplFreetype_FontSrcContainsGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImWchar codepoint)
 {
     IM_UNUSED(atlas);
@@ -593,6 +605,7 @@ const ImFontLoader* ImGuiFreeType::GetFontLoader()
     loader->FontBakedInit = ImGui_ImplFreeType_FontBakedInit;
     loader->FontBakedDestroy = ImGui_ImplFreeType_FontBakedDestroy;
     loader->FontBakedLoadGlyph = ImGui_ImplFreeType_FontBakedLoadGlyph;
+    loader->FontBakedLoadGlyphByIndex = ImGui_ImplFreeType_FontBakedLoadGlyphByIndex;
     loader->FontBakedSrcLoaderDataSize = sizeof(ImGui_ImplFreeType_FontSrcBakedData);
     return loader;
 }

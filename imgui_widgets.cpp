@@ -43,6 +43,9 @@ Index of this file:
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_internal.h"
+#ifdef IMGUI_ENABLE_RTL
+#include "misc/rtl/imgui_rtl.h"
+#endif
 
 // System includes
 #include <stdint.h>     // intptr_t
@@ -183,7 +186,18 @@ void ImGui::TextEx(const char* text, const char* text_end, ImGuiTextFlags flags)
         const float wrap_width = wrap_enabled ? CalcWrapWidthForPos(window->DC.CursorPos, wrap_pos_x) : 0.0f;
         const ImVec2 text_size = CalcTextSize(text_begin, text_end, false, wrap_width);
 
-        ImRect bb(text_pos, text_pos + text_size);
+        // Right-align text that resolves to an RTL base direction. For wrapped text this is
+        // done per-line inside the shaped render path (so the short last line of a wrapped
+        // paragraph is flush-right); for unwrapped text we right-align the whole block here.
+        // Only do so for text starting a line: an inline RTL run after SameLine() must stay in
+        // place, otherwise it would be pushed to the right edge and overlap its neighbours.
+        ImVec2 text_pos_aligned = text_pos;
+#ifdef IMGUI_ENABLE_RTL
+        if (!wrap_enabled && !window->DC.IsSameLine)
+            text_pos_aligned.x = ImGuiRTL::AlignTextRight(text_pos.x, window->WorkRect.Max.x, text_begin, text_end, text_size.x);
+#endif
+
+        ImRect bb(text_pos_aligned, text_pos_aligned + text_size);
         ItemSize(text_size, 0.0f);
         if (!ItemAdd(bb, 0))
             return;
@@ -4214,6 +4228,31 @@ static int  STB_TEXTEDIT_MOVEWORDRIGHT_IMPL(ImGuiInputTextState* obj, int idx)  
 #define STB_TEXTEDIT_MOVEWORDLEFT       STB_TEXTEDIT_MOVEWORDLEFT_IMPL  // They need to be #define for stb_textedit.h
 #define STB_TEXTEDIT_MOVEWORDRIGHT      STB_TEXTEDIT_MOVEWORDRIGHT_IMPL
 
+// Shaper-aware equivalent of ImFontCalcWordWrapPositionEx() for the word-wrap-aware Home/End
+// handlers below: returns the end of the visual line starting at 'text'. Without this, Home/End
+// would use the stock LTR wrap positions, which do not match the shaped wrapping used to render
+// (and to index) RTL/bidi text. Falls back to the stock function when no shaping applies.
+static const char* InputTextCalcWordWrapPosition(ImGuiContext& g, const char* text, const char* text_end, float wrap_width)
+{
+#ifdef IMGUI_ENABLE_RTL
+    const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+    if (shaper != NULL && shaper->ShapeText != NULL && g.FontBaked != NULL && wrap_width > 0.0f)
+    {
+        const char* logical_end = (const char*)ImMemchr(text, '\n', text_end - text);
+        if (logical_end == NULL)
+            logical_end = text_end;
+        ImVector<const char*> starts;
+        ImFontShapedWrapLine(g.Font, g.FontBaked, shaper, g.FontSize, text, logical_end, wrap_width, &starts, ImDrawTextFlags_WrapKeepBlanks);
+        if (starts.Size >= 2)
+            return starts[1];               // End of the first visual line (= start of the next one).
+        return (logical_end < text_end) ? logical_end : text_end; // Whole line fits: stop at '\n'/end.
+    }
+#else
+    IM_UNUSED(g);
+#endif
+    return ImFontCalcWordWrapPositionEx(g.Font, g.FontSize, text, text_end, wrap_width, ImDrawTextFlags_WrapKeepBlanks);
+}
+
 // Reimplementation of stb_textedit_move_line_start()/stb_textedit_move_line_end() which supports word-wrapping.
 static int STB_TEXTEDIT_MOVELINESTART_IMPL(ImGuiInputTextState* obj, ImStb::STB_TexteditState* state, int cursor)
 {
@@ -4229,7 +4268,7 @@ static int STB_TEXTEDIT_MOVELINESTART_IMPL(ImGuiInputTextState* obj, ImStb::STB_
         const char* text_end = obj->TextSrc + obj->TextLen; // End of line would be enough
         while (p >= p_bol)
         {
-            const char* p_eol = ImFontCalcWordWrapPositionEx(g.Font, g.FontSize, p, text_end, obj->WrapWidth, ImDrawTextFlags_WrapKeepBlanks);
+            const char* p_eol = InputTextCalcWordWrapPosition(g, p, text_end, obj->WrapWidth);
             if (p == p_cursor) // If we are already on a visible beginning-of-line, return real beginning-of-line (would be same as regular handler below)
                 return (int)(p_bol - obj->TextSrc);
             if (p_eol == p_cursor && obj->TextA[cursor] != '\n' && obj->LastMoveDirectionLR == ImGuiDir_Left)
@@ -4265,7 +4304,7 @@ static int STB_TEXTEDIT_MOVELINEEND_IMPL(ImGuiInputTextState* obj, ImStb::STB_Te
         const char* text_end = obj->TextSrc + obj->TextLen; // End of line would be enough
         while (p < text_end)
         {
-            const char* p_eol = ImFontCalcWordWrapPositionEx(g.Font, g.FontSize, p, text_end, obj->WrapWidth, ImDrawTextFlags_WrapKeepBlanks);
+            const char* p_eol = InputTextCalcWordWrapPosition(g, p, text_end, obj->WrapWidth);
             cursor = (int)(p_eol - obj->TextSrc);
             if (p_eol == p_cursor && obj->LastMoveDirectionLR != ImGuiDir_Left) // If we are already on a visible end-of-line, switch to regular handle
                 break;
@@ -4292,6 +4331,7 @@ static void STB_TEXTEDIT_DELETECHARS(ImGuiInputTextState* obj, int pos, int n)
     memmove(dst, src, obj->TextLen - n - pos + 1);
     obj->EditedBefore = obj->EditedThisFrame = true;
     obj->TextLen -= n;
+    obj->StbCaretAffinity = -1; // Editing invalidates the bidi dual-caret side the caret was on.
 }
 
 static int STB_TEXTEDIT_INSERTCHARS(ImGuiInputTextState* obj, int pos, const char* new_text, int new_text_len)
@@ -4323,6 +4363,7 @@ static int STB_TEXTEDIT_INSERTCHARS(ImGuiInputTextState* obj, int pos, const cha
     obj->EditedBefore = obj->EditedThisFrame = true;
     obj->TextLen += new_text_len;
     obj->TextA[obj->TextLen] = '\0';
+    obj->StbCaretAffinity = -1; // Editing invalidates the bidi dual-caret side the caret was on.
 
     return new_text_len;
 }
@@ -4377,6 +4418,7 @@ ImGuiInputTextState::ImGuiInputTextState()
     memset((void*)this, 0, sizeof(*this));
     Stb = IM_NEW(ImStbTexteditState);
     memset(Stb, 0, sizeof(*Stb));
+    StbCaretAffinity = -1; // unknown: no known bidi caret side yet.
 }
 
 ImGuiInputTextState::~ImGuiInputTextState()
@@ -4421,6 +4463,117 @@ void ImGuiInputTextState::SelectAll()                       { Stb->select_start 
 void ImGuiInputTextState::ReloadUserBufAndSelectAll()       { WantReloadUserBuf = true; ReloadSelectionStart = 0; ReloadSelectionEnd = INT_MAX; }
 void ImGuiInputTextState::ReloadUserBufAndKeepSelection()   { WantReloadUserBuf = true; ReloadSelectionStart = Stb->select_start; ReloadSelectionEnd = Stb->select_end; }
 void ImGuiInputTextState::ReloadUserBufAndMoveToEnd()       { WantReloadUserBuf = true; ReloadSelectionStart = ReloadSelectionEnd = INT_MAX; }
+
+#ifdef IMGUI_ENABLE_RTL
+static void InputTextGetCaretLine(ImGuiInputTextState* state, const char** out_start, const char** out_end);
+#endif
+
+// Move the caret/selection one *visual* step (visual_dir: +1 = right, -1 = left) using the
+// shaper's bidi-aware mapping. This is the correct way to step between characters in mixed
+// bidi text (a logical next/prev step would oscillate at run boundaries) and it also skips
+// combining marks (harakat), since they share their base glyph's cluster. Mirrors stb's
+// selection semantics. Returns true if handled; false if the caller should fall back to the
+// stock LTR char step (pure ASCII, or no shaper).
+static bool InputTextMoveCursorVisual(ImGuiContext& g, ImGuiInputTextState* state, int visual_dir, bool shift)
+{
+#ifdef IMGUI_ENABLE_RTL
+    const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+    if (shaper != NULL && shaper->MoveCaretVisual != NULL && g.FontBaked != NULL)
+    {
+        const char* line_start, * line_end;
+        InputTextGetCaretLine(state, &line_start, &line_end);
+        const int cursor_rel = (int)(state->Stb->cursor - (line_start - state->TextA.Data));
+        int target_affinity = -1;
+        const int target_rel = shaper->MoveCaretVisual(g.Font, g.FontBaked, line_start, line_end, cursor_rel, visual_dir, state->StbCaretAffinity, &target_affinity);
+        if (target_rel < 0)
+            return false; // not handled (pure ASCII / non-boundary): fall back to stb
+        if (target_rel == cursor_rel)
+        {
+            // At the visual edge: no movement, but this IS handled (do NOT fall back to stb's
+            // logical Left/Right, which would move the caret back the other way in RTL text).
+            state->CursorAnimReset();
+            return true;
+        }
+        {
+            const int target = (int)(target_rel + (line_start - state->TextA.Data));
+            ImStb::STB_TexteditState* st = state->Stb;
+
+            if (!shift)
+            {
+                if (STB_TEXT_HAS_SELECTION(st))
+                {
+                    if (visual_dir > 0) ImStb::stb_textedit_move_to_last(state, st);   // collapse to selection end
+                    else ImStb::stb_textedit_move_to_first(st);                        // collapse to selection start
+                }
+                else
+                {
+                    st->cursor = target;
+                }
+                ImStb::stb_textedit_clamp(state, st);
+                st->has_preferred_x = 0;
+            }
+            else
+            {
+                ImStb::stb_textedit_clamp(state, st);
+                ImStb::stb_textedit_prep_selection_at_cursor(st);
+                st->select_end = target;
+                st->cursor = st->select_end;
+                ImStb::stb_textedit_clamp(state, st);
+                st->has_preferred_x = 0;
+            }
+
+            state->CursorFollow = true;
+            state->CursorAnimReset();
+            state->LastMoveDirectionLR = (visual_dir > 0) ? ImGuiDir_Right : ImGuiDir_Left;
+            state->StbCaretAffinity = (ImS8)target_affinity;
+            return true;
+        }
+    }
+#else
+    IM_UNUSED(g); IM_UNUSED(state); IM_UNUSED(visual_dir); IM_UNUSED(shift);
+#endif
+    return false;
+}
+
+#ifdef IMGUI_ENABLE_RTL
+// Return the logical line [*out_start, *out_end) (newline-delimited) containing the caret.
+static void InputTextGetCaretLine(ImGuiInputTextState* state, const char** out_start, const char** out_end)
+{
+    const char* buf = state->TextA.Data;
+    const char* buf_end = buf + state->TextLen;
+    const char* line_start = buf;
+    const char* line_end = buf_end;
+    for (const char* p = buf; p < buf_end && (p - buf) < state->Stb->cursor; p++)
+        if (*p == '\n')
+            line_start = p + 1;
+    for (const char* p = line_start; p < buf_end; p++)
+        if (*p == '\n') { line_end = p; break; }
+    *out_start = line_start;
+    *out_end = line_end;
+}
+#endif
+
+// Resolved direction at the caret for arrow-key movement: per-run when the shaper can tell
+// us, otherwise the line/paragraph direction (fallback_rtl). This makes the arrow keys follow
+// the *local* run direction inside a mixed bidi line (e.g. Arabic inside an English line).
+static bool InputTextCursorIsRtl(ImGuiContext& g, ImGuiInputTextState* state, bool fallback_rtl)
+{
+#ifdef IMGUI_ENABLE_RTL
+    const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+    if (shaper != NULL && shaper->DirectionAt != NULL && g.FontBaked != NULL)
+    {
+        const char* line_start, * line_end;
+        InputTextGetCaretLine(state, &line_start, &line_end);
+        const int caret_rel = (int)(state->Stb->cursor - (line_start - state->TextA.Data));
+        const int dir = shaper->DirectionAt(g.Font, g.FontBaked, line_start, line_end, caret_rel);
+        if (dir >= 0)
+            return dir == 1;
+    }
+#else
+    IM_UNUSED(g); IM_UNUSED(state); IM_UNUSED(fallback_rtl);
+#endif
+    return fallback_rtl;
+}
 
 ImGuiInputTextCallbackData::ImGuiInputTextCallbackData()
 {
@@ -4719,11 +4872,42 @@ static int InputTextLineIndexBuild(ImGuiInputTextFlags flags, ImGuiTextIndex* li
     bool trailing_line_already_counted = false;
     if (flags & ImGuiInputTextFlags_WordWrap)
     {
-        for (s = buf; s < buf_end; s = (*s == '\n') ? s + 1 : s)
+        const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+        ImFontBaked* baked = (shaper != NULL) ? g.Font->GetFontBaked(g.FontSize) : NULL;
+        s = buf;
+        while (s < buf_end)
         {
-            if (size++ <= max_output_buffer_size)
-                line_index->Offsets.push_back((int)(s - buf));
-            s = ImFontCalcWordWrapPositionEx(g.Font, g.FontSize, s, buf_end, wrap_width, ImDrawTextFlags_WrapKeepBlanks);
+            // Find the end of this logical line (a '\n' or the end of the buffer).
+            const char* logical_end = (const char*)ImMemchr(s, '\n', buf_end - s);
+            if (logical_end == NULL)
+                logical_end = buf_end;
+
+            if (shaper != NULL && shaper->ShapeText != NULL && baked != NULL)
+            {
+                // RTL/bidi-aware wrap: break this logical line into visual lines exactly the
+                // same way the display path does, so the line index (caret/selection) matches
+                // the rendered text. Falls back to LTR wrap internally for text that needs no shaping.
+                ImVector<const char*> starts;
+                ImFontShapedWrapLine(g.Font, baked, shaper, g.FontSize, s, logical_end, wrap_width, &starts, ImDrawTextFlags_WrapKeepBlanks);
+                for (int i = 0; i < starts.Size; i++)
+                    if (size++ <= max_output_buffer_size)
+                        line_index->Offsets.push_back((int)(starts[i] - buf));
+            }
+            else
+            {
+                // Standard LTR word-wrap.
+                const char* p = s;
+                for (;;)
+                {
+                    if (size++ <= max_output_buffer_size)
+                        line_index->Offsets.push_back((int)(p - buf));
+                    p = ImFontCalcWordWrapPositionEx(g.Font, g.FontSize, p, logical_end, wrap_width, ImDrawTextFlags_WrapKeepBlanks);
+                    if (p >= logical_end)
+                        break;
+                }
+            }
+
+            s = (logical_end < buf_end) ? logical_end + 1 : logical_end;
         }
     }
     else if (buf_end != NULL)
@@ -4774,10 +4958,206 @@ static ImVec2 InputTextLineIndexGetPosOffset(ImGuiContext& g, ImGuiInputTextStat
 
     const int line_no = (it == it_begin) ? 0 : line_index->Offsets.index_from_ptr(it);
     const char* line_start = line_index->get_line_begin(buf, line_no);
+    const char* line_end = line_index->get_line_end(buf, line_no);
     ImVec2 offset;
-    offset.x = InputTextCalcTextSize(&g, line_start, cursor_ptr, buf_end, NULL, NULL, ImDrawTextFlags_WrapKeepBlanks).x;
+
+    // RTL/bidi: use the text shaper to map the logical byte offset to a visual x position
+    // within this visual line. The line index uses shaped wrapping, so wrapped sub-lines are
+    // valid shaping boundaries too.
+    const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+    float shaped_x = -1.0f;
+    if (shaper != NULL && shaper->IndexToXOffset != NULL && g.FontBaked != NULL)
+        shaped_x = shaper->IndexToXOffset(g.Font, g.FontBaked, line_start, line_end, (int)(cursor_ptr - line_start), (state != NULL) ? state->StbCaretAffinity : -1);
+    if (shaped_x >= 0.0f)
+        offset.x = shaped_x;
+    else
+        offset.x = InputTextCalcTextSize(&g, line_start, cursor_ptr, buf_end, NULL, NULL, ImDrawTextFlags_WrapKeepBlanks).x;
+
     offset.y = (line_no + 1) * g.FontSize;
     return offset;
+}
+
+// Horizontal offset applied to right-align RTL text inside an InputText (0 for LTR text, empty
+// text, or text wider than the area). Used both when rendering and when offsetting the mouse x
+// so click/drag hit-testing stays consistent with the drawn position.
+static float InputTextRtlAlignShift(ImGuiContext& g, const ImGuiStyle& style, const ImRect& frame_bb, const ImVec2& inner_size, float wrap_width, bool is_multiline, ImGuiWindow* draw_window, const char* text, const char* text_end, ImGuiInputTextFlags flags)
+{
+#ifdef IMGUI_ENABLE_RTL
+    if ((flags & ImGuiInputTextFlags_ElideLeft) == 0 && wrap_width <= 0.0f && text_end != NULL && text < text_end)
+    {
+        const float origin_x = is_multiline ? draw_window->DC.CursorPos.x : (frame_bb.Min.x + style.FramePadding.x);
+        const float text_w = g.Font->CalcTextSizeA(g.FontSize, FLT_MAX, wrap_width, text, text_end).x;
+        const float align_max_x = frame_bb.Min.x + inner_size.x - style.FramePadding.x;
+        return ImGuiRTL::AlignTextRight(origin_x, align_max_x, text, text_end, text_w) - origin_x;
+    }
+#else
+    IM_UNUSED(g); IM_UNUSED(style); IM_UNUSED(frame_bb); IM_UNUSED(inner_size); IM_UNUSED(wrap_width); IM_UNUSED(is_multiline); IM_UNUSED(draw_window); IM_UNUSED(text); IM_UNUSED(text_end); IM_UNUSED(flags);
+#endif
+    return 0.0f;
+}
+
+// Per-line flush-right offset for a wrapped RTL visual line (0 for LTR/ASCII/unwrapped/wide lines).
+// [line_start, line_end) is the visual line (already adjusted to match the shaped render path).
+// Advances are converted with the same scale as ImFontShapedRenderLine(), so that the shift matches
+// the drawn position even when the baked size differs from the current font size (DPI scaling etc.).
+static float InputTextRtlLineShift(ImGuiContext& g, const ImFontShaper* shaper, const char* line_start, const char* line_end, float wrap_width)
+{
+#ifdef IMGUI_ENABLE_RTL
+    if (wrap_width <= 0.0f || shaper == NULL || g.FontBaked == NULL || line_start >= line_end)
+        return 0.0f;
+    float line_w = 0.0f;
+    int base_dir = 0;
+    if (ImFontShapedCalcLineMetrics(g.Font, g.FontBaked, g.FontSize, line_start, line_end, &line_w, &base_dir) && base_dir == 1 && line_w < wrap_width)
+        return wrap_width - line_w;
+#else
+    IM_UNUSED(g); IM_UNUSED(shaper); IM_UNUSED(line_start); IM_UNUSED(line_end); IM_UNUSED(wrap_width);
+#endif
+    return 0.0f;
+}
+
+// RTL/bidi-aware mouse click/drag for InputText: map the mouse position to a logical byte index
+// using the text shaper and update the stb state directly. Returns true if handled (caller skips
+// stb_textedit_click/drag), false to fall back to the LTR behavior. Handles both single-line and
+// multi-line (the multi-line path builds a shaper-aware line index and maps y -> visual line).
+static bool InputTextShapedClick(ImGuiContext& g, ImGuiInputTextState* state, float wrap_width, float mouse_x, float mouse_y, bool is_drag)
+{
+    const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+    if (shaper == NULL || shaper->XOffsetToIndex == NULL || g.FontBaked == NULL)
+        return false;
+
+    const char* text = state->TextA.Data;
+    const char* text_end = text + state->TextLen;
+    if (text >= text_end)
+        return false;
+
+    int idx = -1;
+    if (state->Flags & ImGuiInputTextFlags_Multiline)
+    {
+        // Build the (shaper-aware) line index for the current editing text. This matches the
+        // line index built during rendering, so visual lines correspond to the displayed text.
+        ImGuiTextIndex line_index;
+        const int line_count = InputTextLineIndexBuild(state->Flags, &line_index, text, text_end, wrap_width, INT_MAX, NULL);
+        line_index.EndOffset = (int)(text_end - text);
+
+        const int line_no = (int)ImFloor(mouse_y / g.FontSize);
+        if (line_no < 0)
+            idx = 0;
+        else if (line_no >= line_count)
+            idx = (int)(text_end - text);
+        else
+        {
+            const char* line_start = line_index.get_line_begin(text, line_no);
+            const char* line_end = line_index.get_line_end(text, line_no);
+
+            // Word-wrapped RTL lines are flush-right within wrap_width (see the shaped render
+            // path); un-shift the mouse x by the same per-line offset so hit-testing matches.
+            const float click_x = mouse_x - InputTextRtlLineShift(g, shaper, line_start, line_end, wrap_width);
+
+            const int rel = shaper->XOffsetToIndex(g.Font, g.FontBaked, line_start, line_end, click_x);
+            if (rel < 0)
+                return false;
+            idx = (int)(line_start - text) + rel;
+        }
+    }
+    else
+    {
+        idx = shaper->XOffsetToIndex(g.Font, g.FontBaked, text, text_end, mouse_x);
+        if (idx < 0)
+            return false;
+    }
+
+    if (is_drag)
+    {
+        if (state->Stb->select_start == state->Stb->select_end)
+            state->Stb->select_start = state->Stb->cursor;
+        state->Stb->cursor = state->Stb->select_end = idx;
+    }
+    else
+    {
+        state->Stb->cursor = idx;
+        state->Stb->select_start = idx;
+        state->Stb->select_end = idx;
+        state->Stb->has_preferred_x = 0;
+    }
+    state->LastMoveDirectionLR = ImGuiDir_Left;
+    state->StbCaretAffinity = -1; // unknown: a click's bidi side isn't tracked here.
+    return true;
+}
+
+// Shaper-aware vertical caret movement (Up/Down arrows) for multi-line RTL text. Maps the current
+// caret's visual x (its preferred column) onto the adjacent visual line using the shaper, instead of
+// stb's LTR char-advance scan. Returns true if handled.
+static bool InputTextShapedMoveVertical(ImGuiContext& g, ImGuiInputTextState* state, float wrap_width, bool move_up, bool is_shift)
+{
+    const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+    if (shaper == NULL || shaper->IndexToXOffset == NULL || shaper->XOffsetToIndex == NULL || g.FontBaked == NULL)
+        return false;
+
+    const char* text = state->TextA.Data;
+    const char* text_end = text + state->TextLen;
+    if (text >= text_end)
+        return false;
+
+    ImGuiTextIndex line_index;
+    const int line_count = InputTextLineIndexBuild(state->Flags, &line_index, text, text_end, wrap_width, INT_MAX, NULL);
+    line_index.EndOffset = (int)(text_end - text);
+    if (line_count <= 1)
+        return true; // Single line: nothing to move to; still handle it to avoid the LTR fallback.
+
+    // Locate the visual line containing the cursor (mirrors InputTextLineIndexGetPosOffset).
+    const int cursor_n = state->Stb->cursor;
+    int* it_begin = line_index.Offsets.begin();
+    int* it_end = line_index.Offsets.end();
+    const int* it = ImLowerBound(it_begin, it_end, cursor_n);
+    if (it > it_begin)
+        if (it == it_end || *it != cursor_n || (state->WrapWidth > 0.0f && state->LastMoveDirectionLR == ImGuiDir_Right && cursor_n > 0 && text[cursor_n - 1] != '\n' && text[cursor_n - 1] != 0))
+            it--;
+    const int line_no = (it == it_begin) ? 0 : line_index.Offsets.index_from_ptr(it);
+    const char* line_start = line_index.get_line_begin(text, line_no);
+    const char* line_end = line_index.get_line_end(text, line_no);
+
+    // Preferred visual column: reuse stb's preferred_x if set, otherwise measure the caret x now.
+    float goal_x;
+    if (state->Stb->has_preferred_x)
+        goal_x = state->Stb->preferred_x;
+    else
+    {
+        goal_x = shaper->IndexToXOffset(g.Font, g.FontBaked, line_start, line_end, cursor_n - (int)(line_start - text), state->StbCaretAffinity);
+        if (goal_x < 0.0f)
+            return false;
+    }
+
+    int target_line = line_no + (move_up ? -1 : 1);
+    if (target_line < 0)
+        target_line = 0;
+    if (target_line >= line_count)
+        target_line = line_count - 1;
+    if (target_line == line_no)
+        return true; // Already at the edge.
+
+    const char* t_start = line_index.get_line_begin(text, target_line);
+    const char* t_end = line_index.get_line_end(text, target_line);
+    const int rel = shaper->XOffsetToIndex(g.Font, g.FontBaked, t_start, t_end, goal_x);
+    if (rel < 0)
+        return false;
+    const int new_cursor = (int)(t_start - text) + rel;
+
+    if (is_shift)
+    {
+        if (state->Stb->select_start == state->Stb->select_end)
+            state->Stb->select_start = state->Stb->cursor;
+        state->Stb->cursor = state->Stb->select_end = new_cursor;
+    }
+    else
+    {
+        state->Stb->cursor = new_cursor;
+        state->Stb->select_start = state->Stb->select_end = new_cursor;
+    }
+    state->Stb->has_preferred_x = 1;
+    state->Stb->preferred_x = goal_x;
+    state->LastMoveDirectionLR = ImGuiDir_Left;
+    state->StbCaretAffinity = -1; // unknown after a vertical move.
+    return true;
 }
 
 // Edit a string of text
@@ -5090,7 +5470,8 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         g.ActiveIdAllowOverlap = !io.MouseDown[0];
 
         // Edit in progress
-        const float mouse_x = (io.MousePos.x - frame_bb.Min.x - style.FramePadding.x) + state->Scroll.x;
+        float mouse_x = (io.MousePos.x - frame_bb.Min.x - style.FramePadding.x) + state->Scroll.x;
+        mouse_x -= InputTextRtlAlignShift(g, style, frame_bb, inner_size, wrap_width, is_multiline, draw_window, state->TextA.Data, state->TextA.Data + state->TextLen, flags); // RTL right-aligned text is drawn shifted right; un-shift so click/drag mapping matches.
         const float mouse_y = (is_multiline ? (io.MousePos.y - draw_window->DC.CursorPos.y) : (g.FontSize * 0.5f));
 
         if (select_all)
@@ -5100,7 +5481,8 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         }
         else if (hovered && io.MouseClickedCount[0] >= 2 && !io.KeyShift)
         {
-            stb_textedit_click(state, state->Stb, mouse_x, mouse_y);
+            if (!InputTextShapedClick(g, state, wrap_width, mouse_x, mouse_y, false))
+                stb_textedit_click(state, state->Stb, mouse_x, mouse_y);
             const int multiclick_count = (io.MouseClickedCount[0] - 2);
             if ((multiclick_count % 2) == 0)
             {
@@ -5139,7 +5521,11 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         {
             if (hovered)
             {
-                if (io.KeyShift)
+                if (InputTextShapedClick(g, state, wrap_width, mouse_x, mouse_y, io.KeyShift))
+                {
+                    // Handled by the shaper.
+                }
+                else if (io.KeyShift)
                     stb_textedit_drag(state, state->Stb, mouse_x, mouse_y);
                 else
                     stb_textedit_click(state, state->Stb, mouse_x, mouse_y);
@@ -5148,7 +5534,8 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         }
         else if (io.MouseDown[0] && !state->SelectedAllMouseLock && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f))
         {
-            stb_textedit_drag(state, state->Stb, mouse_x, mouse_y);
+            if (!InputTextShapedClick(g, state, wrap_width, mouse_x, mouse_y, true))
+                stb_textedit_drag(state, state->Stb, mouse_x, mouse_y);
             state->CursorAnimReset();
             state->CursorFollow = true;
         }
@@ -5207,6 +5594,24 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         const bool is_wordmove_key_down = is_osx ? io.KeyAlt : io.KeyCtrl;                     // OS X style: Text editing cursor movement using Alt instead of Ctrl
         const bool is_startend_key_down = is_osx && io.KeyCtrl && !io.KeySuper && !io.KeyAlt;  // OS X style: Line/Text Start and End using Cmd+Arrows instead of Home/End
 
+        // RTL: swap Left/Right (and their word variants) so the arrows move the caret
+        // *visually*, which is the natural expectation for right-to-left text. The direction is
+        // resolved per-run at the caret (see InputTextCursorIsRtl), with a per-logical-line
+        // fallback for the cases the shaper can't answer (e.g. pure ASCII).
+        bool text_is_rtl = false;
+#ifdef IMGUI_ENABLE_RTL
+        {
+            const char* line_start, * line_end;
+            InputTextGetCaretLine(state, &line_start, &line_end);
+            text_is_rtl = ImGuiRTL::IsRtl(line_start, line_end);
+        }
+#endif
+        // Line start/end are ABSOLUTE positions (byte 0 / last byte), not directional: for RTL,
+        // byte 0 already lands at the visual right edge, so no swap is needed (unlike the
+        // relative word/char keys above, which move in a visual direction).
+        const int k_line_start     = STB_TEXTEDIT_K_LINESTART;
+        const int k_line_end       = STB_TEXTEDIT_K_LINEEND;
+
         // Using Shortcut() with ImGuiInputFlags_RouteFocused (default policy) to allow routing operations for other code (e.g. calling window trying to use Ctrl+A and Ctrl+B: former would be handled by InputText)
         // Otherwise we could simply assume that we own the keys as we are active.
         const ImGuiInputFlags f_repeat = ImGuiInputFlags_Repeat;
@@ -5227,14 +5632,24 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
 
         // FIXME: Should use more Shortcut() and reduce IsKeyPressed()+SetKeyOwner(), but requires modifiers combination to be taken account of.
         // FIXME-OSX: Missing support for Alt(option)+Right/Left = go to end of line, or next line if already in end of line.
-        if (IsKeyPressed(ImGuiKey_LeftArrow))                        { state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_LINESTART : is_wordmove_key_down ? STB_TEXTEDIT_K_WORDLEFT : STB_TEXTEDIT_K_LEFT) | k_mask); }
-        else if (IsKeyPressed(ImGuiKey_RightArrow))                  { state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_LINEEND : is_wordmove_key_down ? STB_TEXTEDIT_K_WORDRIGHT : STB_TEXTEDIT_K_RIGHT) | k_mask); }
-        else if (IsKeyPressed(ImGuiKey_UpArrow) && is_multiline)     { if (io.KeyCtrl) SetScrollY(draw_window, ImMax(draw_window->Scroll.y - g.FontSize, 0.0f)); else state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_TEXTSTART : STB_TEXTEDIT_K_UP) | k_mask); }
-        else if (IsKeyPressed(ImGuiKey_DownArrow) && is_multiline)   { if (io.KeyCtrl) SetScrollY(draw_window, ImMin(draw_window->Scroll.y + g.FontSize, GetScrollMaxY())); else state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_TEXTEND : STB_TEXTEDIT_K_DOWN) | k_mask); }
+        if (IsKeyPressed(ImGuiKey_LeftArrow))
+        {
+            if (is_startend_key_down) { state->OnKeyPressed(k_line_start | k_mask); }
+            else if (is_wordmove_key_down) { const bool rtl = InputTextCursorIsRtl(g, state, text_is_rtl); state->OnKeyPressed((rtl ? STB_TEXTEDIT_K_WORDRIGHT : STB_TEXTEDIT_K_WORDLEFT) | k_mask); }
+            else if (!InputTextMoveCursorVisual(g, state, -1, io.KeyShift)) { state->OnKeyPressed(STB_TEXTEDIT_K_LEFT | k_mask); }
+        }
+        else if (IsKeyPressed(ImGuiKey_RightArrow))
+        {
+            if (is_startend_key_down) { state->OnKeyPressed(k_line_end | k_mask); }
+            else if (is_wordmove_key_down) { const bool rtl = InputTextCursorIsRtl(g, state, text_is_rtl); state->OnKeyPressed((rtl ? STB_TEXTEDIT_K_WORDLEFT : STB_TEXTEDIT_K_WORDRIGHT) | k_mask); }
+            else if (!InputTextMoveCursorVisual(g, state, +1, io.KeyShift)) { state->OnKeyPressed(STB_TEXTEDIT_K_RIGHT | k_mask); }
+        }
+        else if (IsKeyPressed(ImGuiKey_UpArrow) && is_multiline)     { if (io.KeyCtrl) SetScrollY(draw_window, ImMax(draw_window->Scroll.y - g.FontSize, 0.0f)); else if (is_startend_key_down) state->OnKeyPressed(STB_TEXTEDIT_K_TEXTSTART | k_mask); else if (!InputTextShapedMoveVertical(g, state, wrap_width, true, io.KeyShift)) state->OnKeyPressed(STB_TEXTEDIT_K_UP | k_mask); }
+        else if (IsKeyPressed(ImGuiKey_DownArrow) && is_multiline)   { if (io.KeyCtrl) SetScrollY(draw_window, ImMin(draw_window->Scroll.y + g.FontSize, GetScrollMaxY())); else if (is_startend_key_down) state->OnKeyPressed(STB_TEXTEDIT_K_TEXTEND | k_mask); else if (!InputTextShapedMoveVertical(g, state, wrap_width, false, io.KeyShift)) state->OnKeyPressed(STB_TEXTEDIT_K_DOWN | k_mask); }
         else if (IsKeyPressed(ImGuiKey_PageUp) && is_multiline)      { state->OnKeyPressed(STB_TEXTEDIT_K_PGUP | k_mask); scroll_y -= row_count_per_page * g.FontSize; }
         else if (IsKeyPressed(ImGuiKey_PageDown) && is_multiline)    { state->OnKeyPressed(STB_TEXTEDIT_K_PGDOWN | k_mask); scroll_y += row_count_per_page * g.FontSize; }
-        else if (IsKeyPressed(ImGuiKey_Home))                        { state->OnKeyPressed(io.KeyCtrl ? STB_TEXTEDIT_K_TEXTSTART | k_mask : STB_TEXTEDIT_K_LINESTART | k_mask); }
-        else if (IsKeyPressed(ImGuiKey_End))                         { state->OnKeyPressed(io.KeyCtrl ? STB_TEXTEDIT_K_TEXTEND | k_mask : STB_TEXTEDIT_K_LINEEND | k_mask); }
+        else if (IsKeyPressed(ImGuiKey_Home))                        { state->OnKeyPressed(io.KeyCtrl ? STB_TEXTEDIT_K_TEXTSTART | k_mask : k_line_start | k_mask); }
+        else if (IsKeyPressed(ImGuiKey_End))                         { state->OnKeyPressed(io.KeyCtrl ? STB_TEXTEDIT_K_TEXTEND | k_mask : k_line_end | k_mask); }
         else if (IsKeyPressed(ImGuiKey_Delete) && !is_readonly && !is_cut)
         {
             if (!state->HasSelection())
@@ -5635,6 +6050,12 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
 
     // Calculate blinking cursor position
     const ImVec2 cursor_offset = render_cursor && state ? InputTextLineIndexGetPosOffset(g, state, line_index, buf_display, buf_display_end, state->Stb->cursor) : ImVec2(0.0f, 0.0f);
+
+    // Right-align RTL text (single- and multi-line). Applied here, before selection/caret/text
+    // are drawn, so they all shift together. Only applied when the text fits, so the horizontal
+    // scroll math below stays valid.
+    draw_pos.x += InputTextRtlAlignShift(g, style, frame_bb, inner_size, wrap_width, is_multiline, draw_window, buf_display, buf_display_end, flags);
+
     ImVec2 draw_scroll;
 
     // Render text. We currently only render selection when the widget is active or while scrolling.
@@ -5719,22 +6140,77 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                 const char* line_selected_begin = (text_selected_begin > p) ? text_selected_begin : p;
                 const char* line_selected_end = (text_selected_end < p_eol) ? text_selected_end : p_eol;
 
-                float rect_width = 0.0f;
-                if (line_selected_begin < line_selected_end)
-                    rect_width += CalcTextSize(line_selected_begin, line_selected_end).x;
-                if (text_selected_begin <= p_eol && text_selected_end > p_eol && !p_eol_is_wrap)
-                    rect_width += bg_eol_width; // So we can see selected empty lines
-                if (rect_width == 0.0f)
-                    continue;
+                const ImFontShaper* text_shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
+                // Word-wrapped RTL lines are flush-right within wrap_width; offset the selection
+                // rect(s) by the same per-line shift so they match the drawn text.
+                const float line_shift = InputTextRtlLineShift(g, text_shaper, p, p_eol, wrap_width);
 
-                ImRect rect;
-                rect.Min.x = draw_pos.x - draw_scroll.x + CalcTextSize(p, line_selected_begin).x;
-                rect.Min.y = draw_pos.y - draw_scroll.y + line_n * g.FontSize;
-                rect.Max.x = rect.Min.x + rect_width;
-                rect.Max.y = rect.Min.y + bg_offy_dn + g.FontSize;
-                rect.Min.y += bg_offy_up;
-                rect.ClipWith(clip_rect);
-                draw_window->DrawList->AddRectFilled(rect.Min, rect.Max, bg_color);
+                // A logical selection maps to one or more *disjoint* visual runs for RTL/bidi text,
+                // so the highlight must be drawn per visual segment (glyphs whose cluster lies in
+                // the range). A single min..max span would cover reordered text that isn't actually
+                // selected. Pure ASCII (or no shaper) falls back to the stock LTR path.
+                enum { RTL_SEL_MAX_SEGMENTS = 32 };
+                float seg_x0[RTL_SEL_MAX_SEGMENTS];
+                float seg_x1[RTL_SEL_MAX_SEGMENTS];
+                int seg_count = 0;
+                bool shaper_answered = false; // Set when the shaper produced a definitive answer (even an empty one).
+
+                if (text_shaper != NULL && text_shaper->GetSelectionSegments != NULL && g.FontBaked != NULL && line_selected_begin < line_selected_end)
+                {
+                    float segments[RTL_SEL_MAX_SEGMENTS * 2];
+                    const int n = text_shaper->GetSelectionSegments(g.Font, g.FontBaked, p, p_eol,
+                        (int)(line_selected_begin - p), (int)(line_selected_end - p), segments, RTL_SEL_MAX_SEGMENTS);
+                    if (n >= 0)
+                    {
+                        shaper_answered = true;
+                        for (int s = 0; s < n && seg_count < RTL_SEL_MAX_SEGMENTS; s++)
+                        {
+                            seg_x0[seg_count] = segments[s * 2 + 0];
+                            seg_x1[seg_count] = segments[s * 2 + 1];
+                            seg_count++;
+                        }
+                    }
+                    else if (text_shaper->IndexToXOffset != NULL)
+                    {
+                        // Shaper without segment support (or shaped text unavailable): single span.
+                        const float x_begin = text_shaper->IndexToXOffset(g.Font, g.FontBaked, p, p_eol, (int)(line_selected_begin - p), -1);
+                        const float x_end = text_shaper->IndexToXOffset(g.Font, g.FontBaked, p, p_eol, (int)(line_selected_end - p), -1);
+                        if (x_begin >= 0.0f && x_end >= 0.0f)
+                        {
+                            shaper_answered = true;
+                            seg_x0[0] = ImMin(x_begin, x_end);
+                            seg_x1[0] = ImMax(x_begin, x_end);
+                            seg_count = 1;
+                        }
+                    }
+                }
+
+                if (!shaper_answered && seg_count == 0 && line_selected_begin < line_selected_end)
+                {
+                    // Stock LTR path (no shaper, or shaper declined for this line, e.g. pure ASCII).
+                    seg_x0[0] = CalcTextSize(p, line_selected_begin).x;
+                    seg_x1[0] = seg_x0[0] + CalcTextSize(line_selected_begin, line_selected_end).x;
+                    seg_count = 1;
+                }
+
+                // So we can see selected empty lines / the selected newline itself. This is applied
+                // for both the shaped and stock paths.
+                if (text_selected_begin <= p_eol && text_selected_end > p_eol && !p_eol_is_wrap)
+                {
+                    if (seg_count == 0) { seg_x0[0] = 0.0f; seg_x1[0] = bg_eol_width; seg_count = 1; }
+                    else seg_x1[seg_count - 1] += bg_eol_width;
+                }
+
+                for (int s = 0; s < seg_count; s++)
+                {
+                    ImRect rect;
+                    rect.Min.x = draw_pos.x - draw_scroll.x + seg_x0[s] + line_shift;
+                    rect.Min.y = draw_pos.y - draw_scroll.y + line_n * g.FontSize + bg_offy_up;
+                    rect.Max.x = draw_pos.x - draw_scroll.x + seg_x1[s] + line_shift;
+                    rect.Max.y = rect.Min.y + bg_offy_dn + g.FontSize - bg_offy_up;
+                    rect.ClipWith(clip_rect);
+                    draw_window->DrawList->AddRectFilled(rect.Min, rect.Max, bg_color);
+                }
             }
         }
     }
@@ -5758,7 +6234,28 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
     {
         state->CursorAnim += io.DeltaTime;
         bool cursor_is_visible = (!g.IO.ConfigInputTextCursorBlink) || (state->CursorAnim <= 0.0f) || ImFmod(state->CursorAnim, 1.20f) <= 0.80f;
+
+        // Offset the caret by the same per-line flush-right shift as its visual line, so it
+        // tracks the right-aligned RTL text (word-wrapped multi-line case).
+        float caret_line_shift = 0.0f;
+#ifdef IMGUI_ENABLE_RTL
+        if (wrap_width > 0.0f && line_index->Offsets.Size > 0)
+        {
+            const int caret_line = (int)(cursor_offset.y / g.FontSize + 0.5f) - 1;
+            if (caret_line >= 0 && caret_line < line_index->Offsets.Size)
+            {
+                const char* p = line_index->get_line_begin(buf_display, caret_line);
+                const char* p_eol = line_index->get_line_end(buf_display, caret_line);
+                const bool p_eol_is_wrap = (p_eol < buf_display_end && *p_eol != '\n');
+                if (p_eol_is_wrap)
+                    p_eol++;
+                caret_line_shift = InputTextRtlLineShift(g, (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL, p, p_eol, wrap_width);
+            }
+        }
+#endif
+
         ImVec2 cursor_screen_pos = ImTrunc(draw_pos + cursor_offset - draw_scroll);
+        cursor_screen_pos.x += caret_line_shift;
         ImRect cursor_screen_rect(cursor_screen_pos.x, cursor_screen_pos.y - g.FontSize + 0.5f, cursor_screen_pos.x + 1.0f, cursor_screen_pos.y - 1.5f);
         if (cursor_is_visible && cursor_screen_rect.Overlaps(clip_rect))
             draw_window->DrawList->AddLineV(cursor_screen_rect.Min.x, cursor_screen_rect.Min.y, cursor_screen_rect.Max.y, GetColorU32(ImGuiCol_InputTextCursor), style.InputTextCursorSize);
@@ -7671,7 +8168,16 @@ bool ImGui::Selectable(const char* label, bool selected, ImGuiSelectableFlags fl
 
     // Text stays at the submission position. Alignment/clipping extents ignore SpanAllColumns.
     if (is_visible)
-        RenderTextClipped(pos, ImVec2(ImMin(pos.x + size.x, window->WorkRect.Max.x), pos.y + size.y), label, label_end, &label_size, style.SelectableTextAlign, &bb);
+    {
+        ImVec2 text_align = style.SelectableTextAlign;
+#ifdef IMGUI_ENABLE_RTL
+        // Right-align RTL labels when the alignment is left at its default (0.0). A user-specified
+        // alignment (including an explicit -1.0 = left) is always respected.
+        if (text_align.x == 0.0f && ImGuiRTL::IsRtl(label, label_end))
+            text_align.x = 1.0f;
+#endif
+        RenderTextClipped(pos, ImVec2(ImMin(pos.x + size.x, window->WorkRect.Max.x), pos.y + size.y), label, label_end, &label_size, text_align, &bb);
+    }
 
 #ifdef IMGUI_DEBUG_BOXSELECT
     if (g.BoxSelectState.UnclipMode) { GetForegroundDrawList()->AddText(pos, IM_COL32(255,255,0,200), label, label_end); }

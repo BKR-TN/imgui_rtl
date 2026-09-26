@@ -449,6 +449,8 @@ enum ImDrawTextFlags_
 IMGUI_API ImVec2        ImFontCalcTextSizeEx(ImFont* font, float size, float max_width, float wrap_width, const char* text_begin, const char* text_end_display, const char* text_end, const char** out_remaining, ImVec2* out_offset, ImDrawTextFlags flags);
 IMGUI_API const char*   ImFontCalcWordWrapPositionEx(ImFont* font, float size, const char* text, const char* text_end, float wrap_width, ImDrawTextFlags flags = 0);
 IMGUI_API const char*   ImTextCalcWordWrapNextLineStart(const char* text, const char* text_end, ImDrawTextFlags flags = 0); // trim trailing space and find beginning of next line
+IMGUI_API void          ImFontShapedWrapLine(ImFont* font, ImFontBaked* baked, const ImFontShaper* shaper, float size, const char* s, const char* s_end, float wrap_width, ImVector<const char*>* out_line_starts, ImDrawTextFlags flags = 0); // RTL/bidi-aware word-wrap: break a logical line (no '\n') into visual lines. Appends to out_line_starts (pass it empty).
+IMGUI_API bool          ImFontShapedCalcLineMetrics(ImFont* font, ImFontBaked* baked, float size, const char* s, const char* s_end, float* out_width, int* out_base_direction); // Width/base direction of one shaped visual line (same rules as the shaped render path)
 
 // Character classification for word-wrapping logic
 enum ImWcharClass
@@ -1298,6 +1300,7 @@ struct IMGUI_API ImGuiInputTextState
     bool                    ValidatedThisFrame;
     bool                    WantReloadUserBuf;      // force a reload of user buf so it may be modified externally. may be automatic in future version.
     ImS8                    LastMoveDirectionLR;    // ImGuiDir_Left or ImGuiDir_Right. track last movement direction so when cursor cross over a word-wrapping boundaries we can display it on either line depending on last move.s
+    ImS8                    StbCaretAffinity;        // 0 = trailing (attach to previous char), 1 = leading (attach to next char), -1 = unknown. Disambiguates bidi dual-caret positions.
     int                     ReloadSelectionStart;
     int                     ReloadSelectionEnd;
 
@@ -3923,6 +3926,94 @@ namespace ImGui
 //-----------------------------------------------------------------------------
 
 // Hooks and storage for a given font backend.
+//-----------------------------------------------------------------------------
+// [SECTION] Text shaping (bidi + complex-script) backend
+//-----------------------------------------------------------------------------
+// A single glyph produced by a text shaper.
+struct ImShapedGlyph
+{
+    unsigned int    GlyphId;        // Font glyph index (0 = missing/.notdef)
+    int             SourceIdx;      // Index of the font source that produced this glyph (0 = first). Disambiguates merged fonts.
+    int             Dir;            // Resolved bidi direction of the run (0 = LTR, 1 = RTL). Used for caret placement.
+    ImWchar         Codepoint;      // First codepoint of the cluster. Used by the core for control characters (tab etc.).
+    float           XAdvance;       // Horizontal advance in pixels at the baked size
+    float           YAdvance;       // Vertical advance in pixels (0 for horizontal text)
+    float           XOffset;        // Horizontal offset from pen position (GPOS/mark positioning)
+    float           YOffset;        // Vertical offset from pen position
+    unsigned int    Cluster;        // UTF-8 byte offset of the cluster start, relative to text_begin (informational only)
+};
+
+// Text shaping backend. Default is NULL (no shaping: text is rendered LTR, one codepoint = one glyph).
+// This interface is likely to evolve.
+struct ImFontShaper
+{
+    const char*     Name;
+
+    // Shape logical UTF-8 text [text_begin, text_end) into visual-order glyphs using the given
+    // font/baked data. On success sets *out_glyphs to a shaper-owned buffer (valid until the next
+    // ShapeText() call) and returns true. Return false to fall back to the standard LTR codepoint
+    // path (e.g. when the text requires no shaping).
+    bool            (*ShapeText)(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, const ImShapedGlyph** out_glyphs, int* out_glyph_count, int* out_base_direction);
+
+    // Optional pre-check, called by the core for non-ASCII text only: return false when the text
+    // needs no shaping at all (e.g. it only uses scripts without contextual forms, bidi reordering
+    // or mark positioning), so the caller can take the faster standard codepoint path. This lets
+    // e.g. accented Latin text bypass the shaping backend entirely.
+    // May be NULL: the core then routes all non-ASCII text through ShapeText().
+    bool            (*TextNeedsShaping)(const char* text_begin, const char* text_end);
+
+    // Optional text-editing helpers: map between logical UTF-8 byte offsets and visual
+    // x offsets (in pixels, relative to text_begin). Used by InputText to position the
+    // caret/selection and to map mouse clicks to text indices in RTL/bidi text. May be
+    // NULL (the caller then falls back to the LTR codepoint behavior).
+    //
+    // 'affinity' disambiguates bidi dual-caret positions: a single logical byte offset can
+    // legitimately map to TWO visual x positions at a run boundary (e.g. the caret "after
+    // the English word" and "before the Arabic word" share one byte offset but sit on
+    // opposite sides of the Arabic run). affinity: 0 = trailing (attach to previous char),
+    // 1 = leading (attach to next char), -1 = unknown (pick the primary/leftmost).
+    float           (*IndexToXOffset)(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, int byte_offset, int affinity);
+    int             (*XOffsetToIndex)(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, float x_offset);
+
+    // Optional selection helper: fill visual highlight segments for a logical byte range
+    // [sel_begin, sel_end) within [text_begin, text_end). For RTL/bidi text a contiguous
+    // logical selection maps to *multiple disjoint visual runs*, so the highlight must be
+    // drawn as several horizontal [x0, x1] intervals (pixels, relative to text_begin) rather
+    // than a single span from min(IndexToXOffset(begin), IndexToXOffset(end)). Writes up to
+    // max_segments intervals into out_segments (float pairs x0,x1) and returns the count
+    // written (0 = nothing selected). Returns -1 to signal "not supported: fall back to the
+    // IndexToXOffset endpoint span". May be NULL.
+    int             (*GetSelectionSegments)(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, int sel_begin, int sel_end, float* out_segments, int max_segments);
+
+    // Optional direction helper: resolved bidi direction of the run containing the character
+    // at 'byte_offset' (UTF-8 byte offset relative to text_begin, clamped to the last char).
+    // Returns 1 (RTL), 0 (LTR), or -1 (unknown — caller falls back to the paragraph/line
+    // direction). Used to make arrow keys follow the local run direction in mixed bidi text.
+    int             (*DirectionAt)(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, int byte_offset);
+
+    // Optional caret-movement helper: move the caret at 'byte_offset' one *visual* step
+    // ('visual_dir' +1 = right, -1 = left) and return the new UTF-8 byte offset (relative to
+    // text_begin). 'affinity' disambiguates which dual-caret position the caret currently
+    // occupies (same semantics as IndexToXOffset); *out_affinity receives the affinity of the
+    // new position (0/1, or -1 when unambiguous). This is the bidi-correct way to step between
+    // characters, because a logical next/prev step is not visually monotonic across mixed
+    // LTR/RTL runs. Returns -1 on failure (caller falls back to the LTR char step). May be NULL.
+    int             (*MoveCaretVisual)(ImFont* font, ImFontBaked* baked, const char* text_begin, const char* text_end, int byte_offset, int visual_dir, int affinity, int* out_affinity);
+
+    // Optional notification, called by the core right before an ImFont is destroyed (including when
+    // its atlas is destroyed), so a shaper can release per-font resources it cached (font handles,
+    // faces, shaping data, etc.). A shaper that caches anything keyed on ImFont* MUST implement
+    // this, otherwise a later font allocated at the same address would reuse stale data.
+    void            (*FontDestroyed)(ImFont* font);
+
+    ImFontShaper()  { memset((void*)this, 0, sizeof(*this)); }
+};
+
+// Advance (at the baked size) used for one shaped glyph by the core render/measure paths: includes
+// password masking and control-character handling, so a shaper can compute caret/selection geometry
+// consistent with what is drawn. Defined in imgui_draw.cpp.
+IMGUI_API float         ImFontShapedGetGlyphAdvance(ImFontBaked* baked, const ImShapedGlyph& sg); // Advance (at the baked size) used for one shaped glyph by the core render/measure paths (password masking and control characters included)
+
 // This structure is likely to evolve as we add support for incremental atlas updates.
 // Conceptually this could be public, but API is still going to be evolve.
 struct ImFontLoader
@@ -3936,6 +4027,7 @@ struct ImFontLoader
     bool            (*FontBakedInit)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src);
     void            (*FontBakedDestroy)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src);
     bool            (*FontBakedLoadGlyph)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, ImWchar codepoint, ImFontGlyph* out_glyph, float* out_advance_x);
+    bool            (*FontBakedLoadGlyphByIndex)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, unsigned int glyph_index, ImFontGlyph* out_glyph, float* out_advance_x);
 
     // Size of backend data, Per Baked * Per Source. Buffers are managed by core to avoid excessive allocations.
     // FIXME: At this point the two other types of buffers may be managed by core to be consistent?
@@ -4076,6 +4168,7 @@ IMGUI_API ImFontBaked*      ImFontAtlasBakedGetClosestMatch(ImFontAtlas* atlas, 
 IMGUI_API ImFontBaked*      ImFontAtlasBakedAdd(ImFontAtlas* atlas, ImFont* font, float font_size, float font_rasterizer_density, ImGuiID baked_id);
 IMGUI_API void              ImFontAtlasBakedDiscard(ImFontAtlas* atlas, ImFont* font, ImFontBaked* baked);
 IMGUI_API ImFontGlyph*      ImFontAtlasBakedAddFontGlyph(ImFontAtlas* atlas, ImFontBaked* baked, ImFontConfig* src, const ImFontGlyph* in_glyph);
+IMGUI_API ImFontGlyph*      ImFontAtlasBakedAddFontGlyphByIndex(ImFontAtlas* atlas, ImFontBaked* baked, const ImFontGlyph* in_glyph);
 IMGUI_API void              ImFontAtlasBakedAddFontGlyphAdvancedX(ImFontAtlas* atlas, ImFontBaked* baked, ImFontConfig* src, ImWchar codepoint, float advance_x);
 IMGUI_API void              ImFontAtlasBakedDiscardFontGlyph(ImFontAtlas* atlas, ImFont* font, ImFontBaked* baked, ImFontGlyph* glyph);
 IMGUI_API void              ImFontAtlasBakedSetFontGlyphBitmap(ImFontAtlas* atlas, ImFontBaked* baked, ImFontConfig* src, ImFontGlyph* glyph, ImTextureRect* r, const unsigned char* src_pixels, ImTextureFormat src_fmt, int src_pitch);

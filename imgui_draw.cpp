@@ -39,6 +39,9 @@ Index of this file:
 #ifdef IMGUI_ENABLE_FREETYPE
 #include "misc/freetype/imgui_freetype.h"
 #endif
+#ifdef IMGUI_ENABLE_RTL
+#include "misc/rtl/imgui_rtl.h"
+#endif
 
 #include <stdio.h>      // vsnprintf, sscanf, printf
 #include <stdint.h>     // intptr_t
@@ -2668,6 +2671,18 @@ static const ImVec2 FONT_ATLAS_DEFAULT_TEX_CURSOR_DATA[ImGuiMouseCursor_COUNT][3
 
 #define IM_FONTGLYPH_INDEX_UNUSED           ((ImU16)-1) // 0xFFFF
 #define IM_FONTGLYPH_INDEX_NOT_FOUND        ((ImU16)-2) // 0xFFFE
+#define IM_FONTGLYPH_ID_INDEX_UNUSED        ((ImU32)0)
+#define IM_FONTGLYPH_ID_INDEX_NOT_FOUND     ((ImU32)-1) // 0xFFFFFFFF
+#define IM_FONTGLYPH_ID_MAX                 0xFFFF      // OpenType/TrueType 'numGlyphs' is a uint16 field.
+#define IM_FONTGLYPH_SOURCE_IDX_MAX         0xF         // ImFontGlyph::SourceIdx is 4-bit.
+
+// Sparse lookup key: a glyph index is only unique per source (merged fonts can reuse the same
+// glyph index in different sources), so fold the 4-bit source index into the key.
+static inline ImU32 ImFontBakedGlyphIdLookupKey(unsigned int glyph_id, int source_idx)
+{
+    return (glyph_id << 4) | (ImU32)(source_idx & 0xF);
+}
+
 
 ImFontAtlas::ImFontAtlas()
 {
@@ -2761,6 +2776,12 @@ void ImFontAtlas::CompactCache()
 void ImFontAtlas::SetFontLoader(const ImFontLoader* font_loader)
 {
     ImFontAtlasBuildSetupFontLoader(this, font_loader);
+}
+
+void ImFontAtlas::SetFontShaper(const ImFontShaper* font_shaper)
+{
+    FontShaper = font_shaper;
+    FontShaperExplicit = true; // So that SetFontShaper(NULL) isn't undone by a compile-time default shaper on a later atlas build.
 }
 
 static void ImFontAtlasBuildUpdateRendererHasTexturesFromContext(ImFontAtlas* atlas)
@@ -3364,6 +3385,11 @@ void ImFontAtlas::RemoveFont(ImFont* font)
 
     ImFontAtlasBuildUpdatePointers(this);
 
+    // Let a shaping backend release per-font resources while the font (and its OwnerAtlas) is still
+    // valid: ~ImFont() can't do it here because OwnerAtlas is cleared just below.
+    if (FontShaper != NULL && FontShaper->FontDestroyed != NULL)
+        FontShaper->FontDestroyed(font);
+
     font->OwnerAtlas = NULL;
     IM_DELETE(font);
 
@@ -3905,6 +3931,15 @@ void ImFontAtlasBakedDiscardFontGlyph(ImFontAtlas* atlas, ImFont* font, ImFontBa
     IM_UNUSED(font);
     baked->IndexLookup[c] = IM_FONTGLYPH_INDEX_UNUSED;
     baked->IndexAdvanceX[c] = baked->FallbackAdvanceX;
+
+    // Also invalidate the glyph-index lookup: the entry stays in Glyphs[] (indices must remain
+    // stable) but its texture rect was just discarded, so FindGlyphByIndex() must not return it.
+    if (glyph->GlyphId != 0 && glyph->GlyphId <= IM_FONTGLYPH_ID_MAX)
+    {
+        const ImU32 key = ImFontBakedGlyphIdLookupKey(glyph->GlyphId, (int)glyph->SourceIdx);
+        if (key < (ImU32)baked->GlyphIdLookup.Size)
+            baked->GlyphIdLookup[key] = IM_FONTGLYPH_ID_INDEX_UNUSED;
+    }
 }
 
 ImFontBaked* ImFontAtlasBakedAdd(ImFontAtlas* atlas, ImFont* font, float font_size, float font_rasterizer_density, ImGuiID baked_id)
@@ -4343,6 +4378,13 @@ void ImFontAtlasBuildInit(ImFontAtlas* atlas)
 #endif
     }
 
+#ifdef IMGUI_ENABLE_RTL
+    // Attach the default shaper unless the user explicitly called SetFontShaper() (which notably
+    // lets SetFontShaper(NULL) durably disable shaping across atlas rebuilds).
+    if (atlas->FontShaper == NULL && !atlas->FontShaperExplicit)
+        atlas->SetFontShaper(ImGuiRTL::GetShaper());
+#endif
+
     // Create initial texture size
     if (atlas->TexData == NULL || atlas->TexData->Pixels == NULL)
         ImFontAtlasTextureAdd(atlas, ImUpperPowerOfTwo(atlas->TexMinWidth), ImUpperPowerOfTwo(atlas->TexMinHeight));
@@ -4640,6 +4682,49 @@ static ImFontGlyph* ImFontBaked_BuildLoadGlyph(ImFontBaked* baked, ImWchar codep
     return NULL;
 }
 
+// Load a glyph by font glyph index (for text shaping backends). Unlike the codepoint path, there is no
+// fallback substitution: a missing glyph index simply returns NULL so the shaper can skip it.
+// 'source_idx' is required because the same glyph index can exist in several merged sources.
+static ImFontGlyph* ImFontBaked_BuildLoadGlyphByIndex(ImFontBaked* baked, unsigned int glyph_index, int source_idx)
+{
+    if (glyph_index == 0 || glyph_index > IM_FONTGLYPH_ID_MAX)
+        return NULL;
+
+    ImFont* font = baked->OwnerFont;
+    ImFontAtlas* atlas = font->OwnerAtlas;
+    if (atlas->Locked || (font->Flags & ImFontFlags_NoLoadGlyphs))
+        return NULL;
+    if (source_idx < 0 || source_idx > IM_FONTGLYPH_SOURCE_IDX_MAX || source_idx >= font->Sources.Size)
+        return NULL;
+
+    ImFontConfig* src = font->Sources[source_idx];
+    const ImFontLoader* loader = src->FontLoader ? src->FontLoader : atlas->FontLoader;
+    if (loader->FontBakedLoadGlyphByIndex == NULL)
+    {
+        // Loader doesn't know how to load by glyph index (e.g. a third-party ImFontLoader that
+        // predates this feature): shaped text would silently not render, so flag it.
+        IM_ASSERT(0 && "ImFontLoader::FontBakedLoadGlyphByIndex() is not implemented: shaped/indexed glyphs cannot be loaded.");
+        return NULL;
+    }
+
+    // Compute the per-source loader data offset (mirrors the codepoint path).
+    char* loader_user_data_p = (char*)baked->FontLoaderDatas;
+    for (int i = 0; i < source_idx; i++)
+    {
+        const ImFontLoader* l = font->Sources[i]->FontLoader ? font->Sources[i]->FontLoader : atlas->FontLoader;
+        loader_user_data_p += l->FontBakedSrcLoaderDataSize;
+    }
+
+    ImFontGlyph glyph_buf;
+    if (loader->FontBakedLoadGlyphByIndex(atlas, src, baked, loader_user_data_p, glyph_index, &glyph_buf, NULL))
+    {
+        glyph_buf.GlyphId = glyph_index;
+        glyph_buf.SourceIdx = source_idx;
+        return ImFontAtlasBakedAddFontGlyphByIndex(atlas, baked, &glyph_buf);
+    }
+    return NULL;
+}
+
 static float ImFontBaked_BuildLoadGlyphAdvanceX(ImFontBaked* baked, ImWchar codepoint)
 {
     if (baked->Size >= IMGUI_FONT_SIZE_THRESHOLD_FOR_LOADADVANCEXONLYMODE || baked->LoadNoRenderOnLayout)
@@ -4781,14 +4866,10 @@ static bool ImGui_ImplStbTrueType_FontBakedInit(ImFontAtlas* atlas, ImFontConfig
     return true;
 }
 
-static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void*, ImWchar codepoint, ImFontGlyph* out_glyph, float* out_advance_x)
+static bool ImGui_ImplStbTrueType_LoadGlyphByIndex(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, int glyph_index, ImFontGlyph* out_glyph, float* out_advance_x)
 {
-    // Search for first font which has the glyph
     ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
     IM_ASSERT(bd_font_data);
-    int glyph_index = stbtt_FindGlyphIndex(&bd_font_data->FontInfo, (int)codepoint);
-    if (glyph_index == 0)
-        return false;
 
     // Fonts unit to pixels
     int oversample_h, oversample_v;
@@ -4813,7 +4894,7 @@ static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontC
     }
 
     // Prepare glyph
-    out_glyph->Codepoint = codepoint;
+    out_glyph->GlyphId = (unsigned int)glyph_index;
     out_glyph->AdvanceX = advance * scale_for_layout;
 
     // Pack and retrieve position inside texture atlas
@@ -4869,6 +4950,25 @@ static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontC
     return true;
 }
 
+static bool ImGui_ImplStbTrueType_FontBakedLoadGlyph(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data, ImWchar codepoint, ImFontGlyph* out_glyph, float* out_advance_x)
+{
+    IM_UNUSED(loader_data);
+    ImGui_ImplStbTrueType_FontSrcData* bd_font_data = (ImGui_ImplStbTrueType_FontSrcData*)src->FontLoaderData;
+    IM_ASSERT(bd_font_data);
+    int glyph_index = stbtt_FindGlyphIndex(&bd_font_data->FontInfo, (int)codepoint);
+    if (glyph_index == 0)
+        return false;
+    return ImGui_ImplStbTrueType_LoadGlyphByIndex(atlas, src, baked, glyph_index, out_glyph, out_advance_x);
+}
+
+static bool ImGui_ImplStbTrueType_FontBakedLoadGlyphByIndex(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data, unsigned int glyph_index, ImFontGlyph* out_glyph, float* out_advance_x)
+{
+    IM_UNUSED(loader_data);
+    if (glyph_index == 0 || glyph_index > (unsigned int)INT_MAX)
+        return false;
+    return ImGui_ImplStbTrueType_LoadGlyphByIndex(atlas, src, baked, (int)glyph_index, out_glyph, out_advance_x);
+}
+
 const ImFontLoader* ImFontAtlasGetFontLoaderForStbTruetype()
 {
     static ImFontLoader loader;
@@ -4879,6 +4979,7 @@ const ImFontLoader* ImFontAtlasGetFontLoaderForStbTruetype()
     loader.FontBakedInit = ImGui_ImplStbTrueType_FontBakedInit;
     loader.FontBakedDestroy = NULL;
     loader.FontBakedLoadGlyph = ImGui_ImplStbTrueType_FontBakedLoadGlyph;
+    loader.FontBakedLoadGlyphByIndex = ImGui_ImplStbTrueType_FontBakedLoadGlyphByIndex;
     return &loader;
 }
 
@@ -5218,6 +5319,7 @@ void ImFontBaked::ClearOutputData()
     Glyphs.clear();
     IndexAdvanceX.clear();
     IndexLookup.clear();
+    GlyphIdLookup.clear();
     FallbackGlyphIndex = -1;
     Ascent = Descent = 0.0f;
     MetricsTotalSurface = 0;
@@ -5233,6 +5335,10 @@ ImFont::ImFont()
 
 ImFont::~ImFont()
 {
+    // Let a shaping backend release per-font resources it cached (font faces, handles, etc.).
+    // This must happen while OwnerAtlas (and therefore its shaper pointer) is still valid.
+    if (OwnerAtlas != NULL && OwnerAtlas->FontShaper != NULL && OwnerAtlas->FontShaper->FontDestroyed != NULL)
+        OwnerAtlas->FontShaper->FontDestroyed(this);
     ClearOutputData();
 }
 
@@ -5261,6 +5367,18 @@ bool ImFont::IsGlyphRangeUnused(unsigned int c_begin, unsigned int c_last)
 // x0/y0/x1/y1 are offset from the character upper-left layout position, in pixels. Therefore x0/y0 are often fairly close to zero.
 // Not to be mistaken with texture coordinates, which are held by u0/v0/u1/v1 in normalized format (0.0..1.0 on each texture axis).
 // - 'src' is not necessarily == 'this->Sources' because multiple source fonts+configs can be used to build one target font.
+// Update the sparse glyph-id -> glyph index lookup (used by text shaping backends).
+static void ImFontAtlasBakedUpdateGlyphIdLookup(ImFontBaked* baked, ImFontGlyph* glyph)
+{
+    const unsigned int glyph_id = glyph->GlyphId;
+    if (glyph_id == 0 || glyph_id > IM_FONTGLYPH_ID_MAX)
+        return; // 0/.notdef, or an out-of-range id from a custom font loader: nothing to index.
+    const ImU32 key = ImFontBakedGlyphIdLookupKey(glyph_id, (int)glyph->SourceIdx);
+    if (key >= (unsigned int)baked->GlyphIdLookup.Size)
+        baked->GlyphIdLookup.resize(key + 1, IM_FONTGLYPH_ID_INDEX_UNUSED);
+    baked->GlyphIdLookup.Data[key] = (ImU32)((int)(glyph - baked->Glyphs.Data) + 1);
+}
+
 ImFontGlyph* ImFontAtlasBakedAddFontGlyph(ImFontAtlas* atlas, ImFontBaked* baked, ImFontConfig* src, const ImFontGlyph* in_glyph)
 {
     int glyph_idx = baked->Glyphs.Size;
@@ -5310,6 +5428,39 @@ ImFontGlyph* ImFontAtlasBakedAddFontGlyph(ImFontAtlas* atlas, ImFontBaked* baked
     baked->IndexLookup[codepoint] = (ImU16)glyph_idx;
     const int page_n = codepoint / 8192;
     baked->OwnerFont->Used8kPagesMap[page_n >> 3] |= 1 << (page_n & 7);
+
+    ImFontAtlasBakedUpdateGlyphIdLookup(baked, glyph);
+
+    return glyph;
+}
+
+// Add a glyph loaded by font glyph index (rather than by codepoint). Used by text shaping backends:
+// shaped glyphs (contextual Arabic forms, ligatures) have no meaningful single codepoint, so they are
+// only reachable through their glyph index. Unlike ImFontAtlasBakedAddFontGlyph() we deliberately do not
+// clamp/snap/space the advance here: positioning is driven by the shaper, which supplies its own advances
+// and offsets.
+ImFontGlyph* ImFontAtlasBakedAddFontGlyphByIndex(ImFontAtlas* atlas, ImFontBaked* baked, const ImFontGlyph* in_glyph)
+{
+    int glyph_idx = baked->Glyphs.Size;
+    baked->Glyphs.push_back(*in_glyph);
+    ImFontGlyph* glyph = &baked->Glyphs[glyph_idx];
+    IM_ASSERT(baked->Glyphs.Size < 0xFFFE);
+
+    // Set UV from packed rectangle
+    if (glyph->PackId != ImFontAtlasRectId_Invalid)
+    {
+        ImTextureRect* r = ImFontAtlasPackGetRect(atlas, glyph->PackId);
+        IM_ASSERT(glyph->U0 == 0.0f && glyph->V0 == 0.0f && glyph->U1 == 0.0f && glyph->V1 == 0.0f);
+        glyph->U0 = (r->x) * atlas->TexUvScale.x;
+        glyph->V0 = (r->y) * atlas->TexUvScale.y;
+        glyph->U1 = (r->x + r->w) * atlas->TexUvScale.x;
+        glyph->V1 = (r->y + r->h) * atlas->TexUvScale.y;
+        baked->MetricsTotalSurface += r->w * r->h;
+    }
+    if (glyph->Colored)
+        atlas->TexPixelsUseColors = atlas->TexData->UseColors = true;
+
+    ImFontAtlasBakedUpdateGlyphIdLookup(baked, glyph);
 
     return glyph;
 }
@@ -5382,6 +5533,40 @@ ImFontGlyph* ImFontBaked::FindGlyphNoFallback(ImWchar c)
     LoadNoFallback = true; // This is actually a rare call, not done in hot-loop, so we prioritize not adding extra cruft to ImFontBaked_BuildLoadGlyph() call sites.
     ImFontGlyph* glyph = ImFontBaked_BuildLoadGlyph(this, c, NULL);
     LoadNoFallback = false;
+    return glyph;
+}
+
+// Find glyph by font glyph index (used by text shaping backends). Load on demand, return NULL if the
+// glyph index does not exist in that source (or is out of range).
+ImFontGlyph* ImFontBaked::FindGlyphByIndex(unsigned int glyph_index, int source_idx)
+{
+    if (glyph_index == 0 || glyph_index > IM_FONTGLYPH_ID_MAX)
+        return NULL;
+    if (source_idx < 0 || source_idx > IM_FONTGLYPH_SOURCE_IDX_MAX)
+        return NULL;
+    const ImU32 key = ImFontBakedGlyphIdLookupKey(glyph_index, source_idx);
+    if (key < (size_t)GlyphIdLookup.Size)
+    {
+        const ImU32 v = GlyphIdLookup.Data[key];
+        if (v == IM_FONTGLYPH_ID_INDEX_NOT_FOUND)
+            return NULL;
+        if (v != IM_FONTGLYPH_ID_INDEX_UNUSED)
+            return &Glyphs.Data[(int)v - 1];
+    }
+    ImFontGlyph* glyph = ImFontBaked_BuildLoadGlyphByIndex(this, glyph_index, source_idx);
+    if (glyph == NULL)
+    {
+        // Only remember *definitive* misses. A transient block (locked atlas, or
+        // ImFontFlags_NoLoadGlyphs which PushPasswordFont() sets for password fields) must not
+        // poison the lookup, otherwise those glyphs would never load again. This mirrors
+        // ImFontBaked_BuildLoadGlyph()'s behavior for the codepoint path.
+        if (!OwnerFont->OwnerAtlas->Locked && (OwnerFont->Flags & ImFontFlags_NoLoadGlyphs) == 0)
+        {
+            if (key >= (size_t)GlyphIdLookup.Size)
+                GlyphIdLookup.resize(key + 1, IM_FONTGLYPH_ID_INDEX_UNUSED);
+            GlyphIdLookup.Data[key] = IM_FONTGLYPH_ID_INDEX_NOT_FOUND;
+        }
+    }
     return glyph;
 }
 
@@ -5678,6 +5863,357 @@ const char* ImFont::CalcWordWrapPosition(float size, const char* text, const cha
     return ImFontCalcWordWrapPositionEx(this, size, text, text_end, wrap_width, ImDrawTextFlags_None);
 }
 
+// Measure text using the shaping backend (single-line and '\n' multi-line; no word-wrap).
+// Measure one visual line [s, s_end) (either shaped or LTR codepoint fallback).
+static bool ImFontTextIsPureAscii(const char* s, const char* s_end)
+{
+    for (const char* p = s; p != s_end; p++)
+        if ((unsigned char)*p >= 0x80)
+            return false;
+    return true;
+}
+
+// --- Shaped-path glyph resolution -------------------------------------------------------------
+// Password/“don’t load glyphs” substitution: when ImFontFlags_NoLoadGlyphs is set (which
+// PushPasswordFont() does for password fields), the standard codepoint path substitutes *every*
+// character with the font's fallback glyph (see ImFontBaked::FindGlyph()), because
+// PushPasswordFont() swaps out IndexLookup/IndexAdvanceX and points FallbackGlyphIndex to '*'.
+// The shaped path must do the same, otherwise a non-ASCII password would either reveal its real
+// glyphs (when already loaded in the atlas) or render nothing at all.
+static bool ImFontShapedIsMasked(const ImFontBaked* baked)
+{
+    return (baked->OwnerFont->Flags & ImFontFlags_NoLoadGlyphs) != 0;
+}
+
+static ImFontGlyph* ImFontShapedGetGlyph(ImFontBaked* baked, const ImShapedGlyph& sg)
+{
+    if (ImFontShapedIsMasked(baked))
+        return (baked->FallbackGlyphIndex >= 0) ? &baked->Glyphs.Data[baked->FallbackGlyphIndex] : NULL;
+    return baked->FindGlyphByIndex(sg.GlyphId, sg.SourceIdx);
+}
+
+// Advance used for one shaped glyph, in pixels at the baked size.
+// - Masked (password) text uses the fallback advance, so the mask looks like the LTR one.
+// - Control characters are handled like the codepoint path: the shaper would otherwise report the
+//   '.notdef' advance for them. '\t' resolves to the tab glyph advance (space * IM_TABSIZE).
+static float ImFontShapedGlyphAdvance(ImFontBaked* baked, const ImShapedGlyph& sg)
+{
+    // '\r' is skipped entirely by the codepoint path (measure and render): zero width, never drawn.
+    if (sg.Codepoint == '\r')
+        return 0.0f;
+    if (ImFontShapedIsMasked(baked))
+        return baked->FallbackAdvanceX;
+    if (sg.Codepoint < 32 && sg.Codepoint != 0)
+        return baked->GetCharAdvance(sg.Codepoint);
+    return sg.XAdvance;
+}
+
+// Public (internal header) accessor for the same advance rule, so a shaper can compute caret and
+// selection geometry consistent with what the core draws (password masking included).
+float ImFontShapedGetGlyphAdvance(ImFontBaked* baked, const ImShapedGlyph& sg)
+{
+    return ImFontShapedGlyphAdvance(baked, sg);
+}
+
+// Per-cluster cumulative widths of a shaped run, so "width of the logical prefix [0, byte_offset)"
+// is a binary search instead of re-summing all glyphs for every candidate wrap position.
+// Note: glyphs are in visual order, so clusters are not sorted; we sort them (insertion sort, as
+// cluster counts are small and visual order is nearly logical order).
+// Per-byte cumulative widths of a shaped run, so "width of the logical prefix [0, byte_offset)" is
+// an O(1) array lookup instead of re-summing glyphs for every candidate wrap position.
+// (Glyphs are in visual order, so their clusters are not sorted; indexing by byte offset sidesteps
+// sorting entirely, at the cost of one float per byte of the line.)
+struct ImFontShapedClusterWidths
+{
+    ImVector<float> PrefixWidths;   // PrefixWidths[i] = width of the glyphs whose cluster is < i
+    float           Total;
+
+    void Build(ImFontBaked* baked, const ImShapedGlyph* glyphs, int glyph_count, int text_len, float scale)
+    {
+        PrefixWidths.resize(text_len + 1);
+        memset(PrefixWidths.Data, 0, sizeof(float) * (size_t)(text_len + 1));
+        for (int i = 0; i < glyph_count; i++)
+        {
+            const int cl = ImClamp((int)glyphs[i].Cluster, 0, text_len);
+            PrefixWidths[cl] += ImFontShapedGlyphAdvance(baked, glyphs[i]) * scale;
+        }
+        float acc = 0.0f;
+        for (int i = 0; i <= text_len; i++)
+        {
+            const float w = PrefixWidths[i];
+            PrefixWidths[i] = acc;
+            acc += w;
+        }
+        Total = acc;
+    }
+
+    // Width of the glyphs whose cluster byte offset is < byte_offset.
+    float PrefixWidth(int byte_offset) const
+    {
+        if (PrefixWidths.Size == 0)
+            return 0.0f;
+        return PrefixWidths[ImClamp(byte_offset, 0, PrefixWidths.Size - 1)];
+    }
+};
+
+// Internal: width of one shaped visual line at 'scale' (baked-size advances multiplied by scale),
+// preloading glyphs like the codepoint path does when measuring. Returns false when the shaper
+// declines (no shaper, or text that needs no shaping), leaving the outputs untouched.
+static bool ImFontShapedMeasureLineEx(ImFont* font, ImFontBaked* baked, const ImFontShaper* shaper, float scale, const char* s, const char* s_end, float* out_width, int* out_base_direction)
+{
+    if (shaper == NULL || shaper->ShapeText == NULL || s >= s_end)
+        return false;
+    const ImShapedGlyph* glyphs = NULL;
+    int glyph_count = 0;
+    int base_dir = 0;
+    if (!shaper->ShapeText(font, baked, s, s_end, &glyphs, &glyph_count, &base_dir) || glyph_count <= 0)
+        return false;
+    float w = 0.0f;
+    for (int i = 0; i < glyph_count; i++)
+    {
+        ImFontShapedGetGlyph(baked, glyphs[i]); // Preload so measuring also packs glyphs (mirrors the LTR path).
+        w += ImFontShapedGlyphAdvance(baked, glyphs[i]) * scale;
+    }
+    if (out_width != NULL)
+        *out_width = w;
+    if (out_base_direction != NULL)
+        *out_base_direction = base_dir;
+    return true;
+}
+
+static float ImFontShapedMeasureLine(ImFont* font, ImFontBaked* baked, const ImFontShaper* shaper, float scale, const char* s, const char* s_end)
+{
+    float w = 0.0f;
+    if (ImFontShapedMeasureLineEx(font, baked, shaper, scale, s, s_end, &w, NULL))
+        return w;
+
+    // No shaping needed (e.g. pure ASCII): measure codepoints exactly like ImFontCalcTextSizeEx().
+    for (const char* p = s; p < s_end; )
+    {
+        unsigned int c = (unsigned int)*p;
+        p += (c < 0x80) ? 1 : ImTextCharFromUtf8(&c, p, s_end);
+        float char_width = (c < (unsigned int)baked->IndexAdvanceX.Size) ? baked->IndexAdvanceX.Data[c] : -1.0f;
+        if (char_width < 0.0f)
+            char_width = BuildLoadGlyphGetAdvanceOrFallback(baked, c);
+        w += char_width * scale;
+    }
+    return w;
+}
+
+// Width of one shaped visual line at 'size' (pixels), applying the same glyph/advance rules as the
+// shaped render path: password/masked substitution and control characters. Returns false when the
+// shaper declines (no shaper, or text that doesn't need shaping), leaving the outputs untouched.
+bool ImFontShapedCalcLineMetrics(ImFont* font, ImFontBaked* baked, float size, const char* s, const char* s_end, float* out_width, int* out_base_direction)
+{
+    const float scale = (baked->Size > 0.0f) ? (size / baked->Size) : 1.0f;
+    return ImFontShapedMeasureLineEx(font, baked, (font != NULL) ? font->OwnerAtlas->FontShaper : NULL, scale, s, s_end, out_width, out_base_direction);
+}
+
+// Break a logical line [s, s_end) (which must not contain '\n') into visual lines no wider
+// than wrap_width. *Appends* the start pointer of each visual line to out_line_starts (which the
+// caller must pass empty; the first entry is always s). Falls back to the standard LTR word-wrap
+// for text that does not need shaping. With wrap_width <= 0 a single line is returned.
+void ImFontShapedWrapLine(ImFont* font, ImFontBaked* baked, const ImFontShaper* shaper, float size, const char* s, const char* s_end, float wrap_width, ImVector<const char*>* out_line_starts, ImDrawTextFlags flags)
+{
+    const float scale = (baked->Size > 0.0f) ? (size / baked->Size) : 1.0f;
+    out_line_starts->push_back(s);
+
+    // No wrapping requested: a single visual line (also protects direct callers).
+    if (wrap_width <= 0.0f)
+        return;
+
+    // Blanks handling must mirror ImFontCalcWordWrapPositionEx()/ImTextCalcWordWrapNextLineStart():
+    // with WrapKeepBlanks the blanks at a wrap point are counted in the line width (and are part of
+    // the previous line), otherwise they are skipped and don't count. InputText uses WrapKeepBlanks
+    // for both its index and its rendering, so passing the same flags keeps them consistent.
+    const bool keep_blanks = (flags & ImDrawTextFlags_WrapKeepBlanks) != 0;
+
+    ImFontShapedClusterWidths cluster_widths; // Hoisted so its capacity is reused across lines.
+    const char* p = s;
+    while (p < s_end)
+    {
+        const ImShapedGlyph* glyphs = NULL;
+        int glyph_count = 0;
+        int base_dir = 0;
+        if (!shaper->ShapeText(font, baked, p, s_end, &glyphs, &glyph_count, &base_dir) || glyph_count <= 0)
+        {
+            // No shaping needed/possible (e.g. pure ASCII): use the standard LTR word-wrap, with the
+            // caller's flags (this is what makes the line index match what the LTR renderer draws).
+            const char* wrap = ImFontCalcWordWrapPositionEx(font, size, p, s_end, wrap_width, flags);
+            if (wrap <= p || wrap >= s_end)
+                break;
+            p = ImTextCalcWordWrapNextLineStart(wrap, s_end, flags);
+            if (p >= s_end)
+                break; // Trailing blanks only: they belong to the previous line, no empty line.
+            out_line_starts->push_back(p);
+            continue;
+        }
+
+        // Width of the logical prefix [p, p + byte_offset). Direction-independent: the
+        // prefix contains exactly the glyphs whose cluster is < byte_offset.
+        cluster_widths.Build(baked, glyphs, glyph_count, (int)(s_end - p), scale);
+        const auto prefix_width = [&](int byte_offset) { return cluster_widths.PrefixWidth(byte_offset); };
+
+        if (prefix_width((int)(s_end - p)) <= wrap_width)
+            break; // the whole remainder fits on one visual line.
+
+        // Find the largest word boundary whose logical prefix fits.
+        // 'sp' points at the blank run, 'se' just after it: the next line always starts after the
+        // blank run (as NextLineStart() does), but the blanks only count in the width when kept.
+        int best = 0;
+        for (const char* sp = (const char*)memchr(p, ' ', s_end - p); sp != NULL; sp = (const char*)memchr(sp + 1, ' ', s_end - (sp + 1)))
+        {
+            const char* se = sp;
+            while (se < s_end && *se == ' ')
+                se++;
+            const int candidate = (int)((keep_blanks ? se : sp) - p);
+            if (candidate > 0 && prefix_width(candidate) <= wrap_width)
+                best = (int)(se - p); // Cut after the blank run.
+            else
+                break;
+        }
+
+        const char* cut;
+        if (best > 0)
+        {
+            cut = p + best;
+        }
+        else
+        {
+            // No word boundary fits: hard-break at the first *complete* UTF-8 character so we never
+            // cut in the middle of a sequence. (A single cluster can be wider than wrap_width, e.g.
+            // in a very narrow widget, in which case the line simply overflows by design.)
+            unsigned int c = (unsigned char)*p;
+            cut = p + ((c < 0x80) ? 1 : ImTextCharFromUtf8(&c, p, s_end));
+            if (cut <= p)
+                break; // Cannot make progress safely: keep the remainder on one (overflowing) line.
+        }
+
+        // A word-boundary cut already sits after the blank run; a hard break may not.
+        while (cut < s_end && *cut == ' ')
+            cut++;
+        if (cut <= p)
+            break;
+        if (cut >= s_end)
+            break; // Nothing left but blanks: they belong to the previous line (no empty line).
+
+        p = cut;
+        out_line_starts->push_back(p);
+    }
+}
+
+static ImVec2 ImFontCalcTextSizeShaped(ImFont* font, ImFontBaked* baked, const ImFontShaper* shaper, float size, float max_width, float wrap_width, const char* text_begin, const char* text_end_display, const char** out_remaining, ImVec2* out_offset, ImDrawTextFlags flags)
+{
+    const float line_height = size;
+    const float scale = line_height / baked->Size;
+    ImVec2 text_size(0, 0);
+    float line_width = 0.0f;
+    const bool word_wrap = (wrap_width > 0.0f);
+    const bool stop_on_newline = (flags & ImDrawTextFlags_StopOnNewLine) != 0;
+
+    ImVector<const char*> wrap_starts; // Hoisted so its capacity is reused across lines.
+    const char* s = text_begin;
+    while (s < text_end_display)
+    {
+        const char* line_end = (const char*)ImMemchr(s, '\n', text_end_display - s);
+        if (line_end == NULL)
+            line_end = text_end_display;
+
+        // Determine the visual sub-lines of this logical line.
+        const char* single_start = s;
+        const char* const* starts = &single_start;
+        int start_count = 1;
+        if (word_wrap)
+        {
+            wrap_starts.clear();
+            ImFontShapedWrapLine(font, baked, shaper, size, s, line_end, wrap_width, &wrap_starts, flags);
+            starts = wrap_starts.Data;
+            start_count = wrap_starts.Size;
+        }
+
+        bool truncated = false;
+        for (int li = 0; li < start_count; li++)
+        {
+            const char* vs = starts[li];
+            const char* ve = (li + 1 < start_count) ? starts[li + 1] : line_end;
+            const float w = ImFontShapedMeasureLine(font, baked, shaper, scale, vs, ve);
+
+            // max_width truncation (ellipsis) — single-line no-wrap case only.
+            if (!word_wrap && w >= max_width)
+            {
+                const ImShapedGlyph* glyphs = NULL;
+                int glyph_count = 0;
+                int trunc_dir = 0;
+                float fit_w = w;
+                if (shaper->ShapeText(font, baked, vs, ve, &glyphs, &glyph_count, &trunc_dir) && glyph_count > 0)
+                {
+                    float w2 = 0.0f;
+                    int last_fit_byte = 0;              // LTR base: end of the displayed logical prefix.
+                    int first_fit_byte = (int)(ve - vs); // RTL base: start of the displayed logical suffix.
+                    for (int i = 0; i < glyph_count; i++)
+                    {
+                        const float glyph_w = ImFontShapedGlyphAdvance(baked, glyphs[i]) * scale;
+                        if (w2 + glyph_w >= max_width && i > 0)
+                            break;
+                        w2 += glyph_w;
+                        const int cl = (int)glyphs[i].Cluster;
+                        if (cl < 0 || cl >= (int)(ve - vs))
+                            continue;
+                        unsigned int c = (unsigned char)vs[cl];
+                        const int cl_end = cl + ((c < 0x80) ? 1 : ImTextCharFromUtf8(&c, vs + cl, ve));
+                        last_fit_byte = ImMax(last_fit_byte, cl_end);
+                        first_fit_byte = ImMin(first_fit_byte, cl);
+                    }
+                    fit_w = w2;
+                    // Mirror the LTR path: 'out_remaining' points at the first character that did not
+                    // fit (for a RTL base direction the displayed run is a logical suffix instead).
+                    if (out_remaining != NULL)
+                        *out_remaining = vs + ((trunc_dir == 1) ? first_fit_byte : last_fit_byte);
+                }
+                else if (out_remaining != NULL)
+                {
+                    *out_remaining = ve;
+                }
+                if (text_size.x < fit_w)
+                    text_size.x = fit_w;
+                text_size.y += line_height;
+                truncated = true;
+                break;
+            }
+
+            line_width = w;
+            if (text_size.x < line_width)
+                text_size.x = line_width;
+            text_size.y += line_height;
+
+            // StopOnNewLine: the caller (InputText's stb_textedit row layout) only wants the
+            // first visual line. Report where it ends so the row's character count is correct.
+            if (stop_on_newline)
+            {
+                if (out_remaining != NULL)
+                {
+                    const char* rem = ve;
+                    if (ve < text_end_display && *ve == '\n')
+                        rem = ve + 1; // Include the hard newline (mirrors the LTR path).
+                    *out_remaining = rem;
+                }
+                truncated = true;
+                break;
+            }
+        }
+
+        if (truncated)
+            break;
+
+        s = (line_end < text_end_display) ? line_end + 1 : line_end;
+    }
+
+    if (out_offset != NULL)
+        *out_offset = ImVec2(line_width, text_size.y + line_height);
+
+    return text_size;
+}
+
 ImVec2 ImFontCalcTextSizeEx(ImFont* font, float size, float max_width, float wrap_width, const char* text_begin, const char* text_end_display, const char* text_end, const char** out_remaining, ImVec2* out_offset, ImDrawTextFlags flags)
 {
     if (!text_end)
@@ -5688,6 +6224,13 @@ ImVec2 ImFontCalcTextSizeEx(ImFont* font, float size, float max_width, float wra
     ImFontBaked* baked = font->GetFontBaked(size);
     const float line_height = size;
     const float scale = line_height / baked->Size;
+
+    // Shaped path (bidi + complex-script shaping). Pure-ASCII text never needs shaping, so keep it on
+    // the original (faster) LTR path even when a shaper is attached. The shaper may also declare via
+    // TextNeedsShaping() that a given non-ASCII run needs no shaping (e.g. accented Latin text).
+    const ImFontShaper* shaper = font->OwnerAtlas->FontShaper;
+    if (shaper != NULL && !ImFontTextIsPureAscii(text_begin, text_end_display) && (shaper->TextNeedsShaping == NULL || shaper->TextNeedsShaping(text_begin, text_end_display)))
+        return ImFontCalcTextSizeShaped(font, baked, shaper, size, max_width, wrap_width, text_begin, text_end_display, out_remaining, out_offset, flags);
 
     ImVec2 text_size = ImVec2(0, 0);
     float line_width = 0.0f;
@@ -5818,6 +6361,161 @@ void ImFont::RenderChar(ImDrawList* draw_list, float size, const ImVec2& pos, Im
     draw_list->PrimRectUV(ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(u1, v1), ImVec2(u2, v2), col);
 }
 
+// Render text using the shaping backend (single-line and '\n' multi-line; no word-wrap).
+// This is called from ImFont::RenderText() when a text shaper is set and word-wrap is disabled.
+// Render one visual line [s, s_end) at (x, y). Advances x locally (caller resets x per line).
+static void ImFontShapedRenderLine(ImDrawList* draw_list, ImFont* font, ImFontBaked* baked, const ImFontShaper* shaper, float size, float scale, float x, float y, ImU32 col, const ImVec4& clip_rect, bool cpu_fine_clip, ImU32 col_untinted, const char* s, const char* s_end, float align_width)
+{
+    const ImShapedGlyph* glyphs = NULL;
+    int glyph_count = 0;
+    int base_dir = 0;
+    if (shaper->ShapeText(font, baked, s, s_end, &glyphs, &glyph_count, &base_dir))
+    {
+        // Per-line flush-right: right-align RTL lines within the wrap width, so the last (short)
+        // line of a wrapped RTL paragraph sits at the right edge instead of the left.
+        if (base_dir == 1 && align_width > 0.0f)
+        {
+            float line_width = 0.0f;
+            for (int i = 0; i < glyph_count; i++)
+                line_width += ImFontShapedGlyphAdvance(baked, glyphs[i]) * scale;
+            if (line_width < align_width)
+                x += align_width - line_width;
+        }
+
+        for (int i = 0; i < glyph_count; i++)
+        {
+            const ImShapedGlyph& sg = glyphs[i];
+            const float glyph_advance = ImFontShapedGlyphAdvance(baked, sg) * scale;
+            ImFontGlyph* glyph = ImFontShapedGetGlyph(baked, sg);
+            if (glyph == NULL || !glyph->Visible)
+            {
+                x += glyph_advance;
+                y += sg.YAdvance * scale;
+                continue;
+            }
+
+            const float px = x + sg.XOffset * scale;
+            const float py = y + sg.YOffset * scale;
+            float x1 = px + glyph->X0 * scale;
+            float x2 = px + glyph->X1 * scale;
+            float y1 = py + glyph->Y0 * scale;
+            float y2 = py + glyph->Y1 * scale;
+            if (x1 <= clip_rect.z && x2 >= clip_rect.x)
+            {
+                float u1 = glyph->U0;
+                float v1 = glyph->V0;
+                float u2 = glyph->U1;
+                float v2 = glyph->V1;
+                if (cpu_fine_clip)
+                {
+                    if (x1 < clip_rect.x) { u1 = u1 + (1.0f - (x2 - clip_rect.x) / (x2 - x1)) * (u2 - u1); x1 = clip_rect.x; }
+                    if (y1 < clip_rect.y) { v1 = v1 + (1.0f - (y2 - clip_rect.y) / (y2 - y1)) * (v2 - v1); y1 = clip_rect.y; }
+                    if (x2 > clip_rect.z) { u2 = u1 + ((clip_rect.z - x1) / (x2 - x1)) * (u2 - u1); x2 = clip_rect.z; }
+                    if (y2 > clip_rect.w) { v2 = v1 + ((clip_rect.w - y1) / (y2 - y1)) * (v2 - v1); y2 = clip_rect.w; }
+                    if (y1 >= y2)
+                    {
+                        x += glyph_advance;
+                        y += sg.YAdvance * scale;
+                        continue;
+                    }
+                }
+
+                ImU32 glyph_col = glyph->Colored ? col_untinted : col;
+                draw_list->PrimReserve(6, 4);
+                draw_list->PrimRectUV(ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(u1, v1), ImVec2(u2, v2), glyph_col);
+            }
+            x += glyph_advance;
+            y += sg.YAdvance * scale;
+        }
+    }
+    else
+    {
+        // No shaping needed (e.g. pure ASCII): render codepoints LTR, matching the standard path
+        // (control characters other than '\n'/'\r' are rendered through their glyph, e.g. tab).
+        for (const char* p = s; p < s_end; )
+        {
+            unsigned int c = (unsigned int)*p;
+            p += (c < 0x80) ? 1 : ImTextCharFromUtf8(&c, p, s_end);
+            if (c == '\n')
+                continue;
+            if (c == '\r')
+                continue;
+            font->RenderChar(draw_list, size, ImVec2(x, y), col, (ImWchar)c, cpu_fine_clip ? &clip_rect : NULL);
+            ImFontGlyph* glyph = baked->FindGlyph((ImWchar)c);
+            x += (glyph != NULL ? glyph->AdvanceX : 0.0f) * scale;
+        }
+    }
+}
+
+static void ImFontRenderTextShaped(ImDrawList* draw_list, ImFont* font, float size, const ImVec2& pos, ImU32 col, const ImVec4& clip_rect, const char* text_begin, const char* text_end, float wrap_width, ImDrawTextFlags flags)
+{
+    ImFontBaked* baked = font->GetFontBaked(size);
+    const ImFontShaper* shaper = font->OwnerAtlas->FontShaper;
+    IM_ASSERT(shaper != NULL);
+    const float scale = size / baked->Size;
+    const float line_height = size;
+
+    float x = pos.x;
+    float y = pos.y;
+    if ((draw_list->Flags & ImDrawListFlags_TextNoPixelSnap) == 0)
+    {
+        x = IM_TRUNC(x);
+        y = IM_TRUNC(y);
+    }
+    if (y > clip_rect.w)
+        return;
+
+    if (!text_end)
+        text_end = text_begin + ImStrlen(text_begin);
+
+    const bool cpu_fine_clip = (flags & ImDrawTextFlags_CpuFineClip) != 0;
+    const ImU32 col_untinted = col | ~IM_COL32_A_MASK;
+    const float origin_x = x;
+    const bool word_wrap = (wrap_width > 0.0f);
+
+    ImVector<const char*> wrap_starts; // Hoisted so its capacity is reused across lines.
+    const char* s = text_begin;
+    while (s < text_end)
+    {
+        const char* line_end = (const char*)ImMemchr(s, '\n', text_end - s);
+        if (line_end == NULL)
+            line_end = text_end;
+
+        // Determine the visual sub-lines of this logical line.
+        const char* single_start = s;
+        const char* const* starts = &single_start;
+        int start_count = 1;
+        if (word_wrap)
+        {
+            wrap_starts.clear();
+            ImFontShapedWrapLine(font, baked, shaper, size, s, line_end, wrap_width, &wrap_starts, flags);
+            starts = wrap_starts.Data;
+            start_count = wrap_starts.Size;
+        }
+
+        // Skip the whole logical line if all of its visual lines are above the clip rect.
+        if (y + line_height * start_count < clip_rect.y)
+        {
+            y += line_height * start_count;
+            s = (line_end < text_end) ? line_end + 1 : line_end;
+            continue;
+        }
+
+        for (int li = 0; li < start_count; li++)
+        {
+            const char* vs = starts[li];
+            const char* ve = (li + 1 < start_count) ? starts[li + 1] : line_end;
+            ImFontShapedRenderLine(draw_list, font, baked, shaper, size, scale, x, y, col, clip_rect, cpu_fine_clip, col_untinted, vs, ve, word_wrap ? wrap_width : 0.0f);
+            y += line_height;
+            if (y > clip_rect.w)
+                return;
+        }
+
+        x = origin_x;
+        s = (line_end < text_end) ? line_end + 1 : line_end;
+    }
+}
+
 // Note: as with every ImDrawList drawing function, this expects that the font atlas texture is bound.
 // DO NOT CALL DIRECTLY THIS WILL CHANGE WILDLY IN 2026. Use ImDrawList::AddText().
 void ImFont::RenderText(ImDrawList* draw_list, float size, const ImVec2& pos, ImU32 col, const ImVec4& clip_rect, const char* text_begin, const char* text_end, float wrap_width, ImDrawTextFlags flags)
@@ -5839,6 +6537,16 @@ begin:
 
     const float line_height = size;
     ImFontBaked* baked = GetFontBaked(size);
+
+    // Shaped path (bidi + complex-script shaping). Pure-ASCII text never needs shaping, so keep it on
+    // the original (faster) LTR path even when a shaper is attached. The shaper may also declare via
+    // TextNeedsShaping() that a given non-ASCII run needs no shaping (e.g. accented Latin text).
+    const ImFontShaper* shaper = OwnerAtlas->FontShaper;
+    if (shaper != NULL && !ImFontTextIsPureAscii(text_begin, text_end) && (shaper->TextNeedsShaping == NULL || shaper->TextNeedsShaping(text_begin, text_end)))
+    {
+        ImFontRenderTextShaped(draw_list, this, size, pos, col, clip_rect, text_begin, text_end, wrap_width, flags);
+        return;
+    }
 
     const float scale = size / baked->Size;
     const float origin_x = x;

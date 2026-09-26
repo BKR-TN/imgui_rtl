@@ -194,6 +194,7 @@ struct ImFontConfig;                // Configuration data when adding a font or 
 struct ImFontGlyph;                 // A single font glyph (code point + coordinates within in ImFontAtlas + offset)
 struct ImFontGlyphRangesBuilder;    // Helper to build glyph ranges from text/string data
 struct ImFontLoader;                // Opaque interface to a font loading backend (stb_truetype, FreeType etc.).
+struct ImFontShaper;                // Opaque interface to a text shaping backend (bidi + complex-script shaping).
 struct ImTextureData;               // Specs and pixel storage for a texture used by Dear ImGui.
 struct ImTextureRect;               // Coordinates of a rectangle within a texture.
 struct ImColor;                     // Helper functions to create a color that can be converted to either u32 or float4 (*OBSOLETE* please avoid using)
@@ -3679,6 +3680,7 @@ struct ImFontGlyph
     unsigned int    Visible : 1;        // Flag to indicate glyph has no visible pixels (e.g. space). Allow early out when rendering.
     unsigned int    SourceIdx : 4;      // Index of source in parent font
     unsigned int    Codepoint : 26;     // 0x0000..0x10FFFF
+    unsigned int    GlyphId;            // Font glyph index (used by text shaping backends). 0 == unknown/.notdef.
     float           AdvanceX;           // Horizontal distance to advance cursor/layout position.
     float           X0, Y0, X1, Y1;     // Glyph corners. Offsets from current cursor/layout position.
     float           U0, V0, U1, V1;     // Texture coordinates for the current value of ImFontAtlas->TexRef. Cached equivalent of calling GetCustomRect() with PackId.
@@ -3763,7 +3765,7 @@ struct ImFontAtlas
     IMGUI_API void              RemoveFont(ImFont* font);                       // Remove a font
     IMGUI_API void              CompactCache();                                 // Compact cached glyphs and texture.
     IMGUI_API void              SetFontLoader(const ImFontLoader* font_loader); // Change font loader at runtime.
-
+    IMGUI_API void              SetFontShaper(const ImFontShaper* font_shaper); // Change text shaper at runtime.
     // Clearing the atlas/fonts has little use nowadays, unless you want to batch remove all fonts.
     // - Since 1.92, you can call ClearFonts() mid-frame, if you load new fonts afterwards.
     // - As we are transitioning toward our new font system the semantic for those functions gets increasingly misleading and are often a source of issues.
@@ -3879,6 +3881,8 @@ struct ImFontAtlas
     const char*                 FontLoaderName;     // Font loader name (for display e.g. in About box) == FontLoader->Name
     void*                       FontLoaderData;     // Font backend opaque storage
     unsigned int                FontLoaderFlags;    // Shared flags (for all fonts) for font loader. THIS IS BUILD IMPLEMENTATION DEPENDENT (e.g. Per-font override is also available in ImFontConfig).
+    const ImFontShaper*         FontShaper;         // Text shaping backend (default NULL: no shaping, text is rendered LTR). Use SetFontShaper() to change at runtime.
+    bool                        FontShaperExplicit; // [Internal] Set when SetFontShaper() was called, so a compile-time default shaper (e.g. IMGUI_ENABLE_RTL) doesn't override a deliberate SetFontShaper(NULL).
     int                         RefCount;           // Number of contexts using this atlas
     ImGuiContext*               OwnerContext;       // Context which own the atlas will be in charge of updating and destroying it.
 
@@ -3911,6 +3915,7 @@ struct ImFontBaked
 
     // [Internal] Members: Hot ~28/36 bytes (for RenderText loop)
     ImVector<ImU16>             IndexLookup;        // 12-16 // out // Sparse. Index glyphs by Unicode code-point.
+    ImVector<ImU32>             GlyphIdLookup;      // 12-16 // out // Sparse. Index glyphs by font glyph index (for text shaping). value = glyph_idx + 1; 0 == unused; 0xFFFFFFFF == not found.
     ImVector<ImFontGlyph>       Glyphs;             // 12-16 // out // All glyphs.
     int                         FallbackGlyphIndex; // 4     // out // Index of FontFallbackChar
 
@@ -3930,6 +3935,7 @@ struct ImFontBaked
     IMGUI_API void              ClearOutputData();
     IMGUI_API ImFontGlyph*      FindGlyph(ImWchar c);               // Return U+FFFD glyph if requested glyph doesn't exists.
     IMGUI_API ImFontGlyph*      FindGlyphNoFallback(ImWchar c);     // Return NULL if glyph doesn't exist
+    IMGUI_API ImFontGlyph*      FindGlyphByIndex(unsigned int glyph_index, int source_idx); // Return NULL if glyph index doesn't exist in that source (or is out of range). Used by text shaping backends.
     IMGUI_API float             GetCharAdvance(ImWchar c);
     IMGUI_API bool              IsGlyphLoaded(ImWchar c);
 };

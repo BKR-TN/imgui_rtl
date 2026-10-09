@@ -258,6 +258,14 @@ Two font-loading tips that matter for Arabic:
   after `SameLine()` is left where it is.
 - **Cursor/selection**: any text the shaper accepts uses shaper-driven caret stops, so
   arrow keys move visually and skip harakat; simple LTR text keeps the stock behaviour.
+- **Font config advance options** are not all honoured on shaped text, by design:
+  `GlyphExtraAdvanceX` (letter-spacing) **is** applied, so mixed Latin/Arabic UIs space
+  consistently; `GlyphMinAdvanceX`/`GlyphMaxAdvanceX` and `PixelSnapH` are **ignored**, because
+  forcing minimum advances would break Arabic cursive joins and snapping would discard the
+  fractional GPOS positioning shaping depends on. See `DESIGN.md` §5.
+- **`ImGuiFreeTypeLoaderFlags_Bitmap`** is supported: the shaper issues the same
+  `FT_Request_Size()` type as the loader for each source, so metrics stay in sync whether or not
+  that flag is used.
 
 ## Current limitations
 

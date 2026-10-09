@@ -3,6 +3,12 @@
 
 #include "imgui_rtl.h"
 
+// For ImGuiFreeTypeLoaderFlags_Bitmap: the shaper must issue the same FT_Request_Size() type as the
+// FreeType loader, which switches to NOMINAL when that flag is set. This is a deliberate coupling --
+// the shaper and the rasterizer have to agree on the font size, and the policy currently lives in the
+// loader. See ImGuiRTL_EnsureFacesSized() and misc/rtl/DESIGN.md section 5.
+#include "imgui_freetype.h"
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -250,6 +256,24 @@ static float ImGuiRTL_GetSourceSize(ImFont* font, ImFontBaked* baked, int src_id
     return size;
 }
 
+// Per-glyph letter-spacing for one source, in pixels at the current baked size.
+// Mirrors the 'offsets_scale' factor ImFontAtlasBakedAddFontGlyph() uses for the codepoint path,
+// so a given ImFontConfig::GlyphExtraAdvanceX produces the same spacing on shaped and unshaped text.
+// Note: that factor is baked->Size / Sources[0]->SizePixels, which intentionally excludes
+// ExtraSizeScale (the loader derives it from SizePixels alone, and separately folds
+// ExtraSizeScale into its glyph-unit scale).
+static float ImGuiRTL_GetSourceExtraAdvance(ImFont* font, ImFontBaked* baked, int src_idx)
+{
+    if (src_idx < 0 || src_idx >= font->Sources.Size)
+        return 0.0f;
+    const float extra = font->Sources[src_idx]->GlyphExtraAdvanceX;
+    if (extra == 0.0f)
+        return 0.0f;
+    const float ref_size = (font->Sources.Size > 0) ? font->Sources[0]->SizePixels : 0.0f;
+    const float offsets_scale = (ref_size != 0.0f) ? (baked->Size / ref_size) : 1.0f;
+    return extra * offsets_scale;
+}
+
 // Density of the first source (used as the uniform scale for the single-scale APIs, e.g.
 // XOffsetToIndex; merged sources are expected to share a density in practice).
 static float ImGuiRTL_GetDensity(ImFont* font, ImFontBaked* baked)
@@ -296,23 +320,36 @@ static bool ImGuiRTL_EnsureFacesSized(ImGuiRTLFontFace* fe, ImFont* font, ImFont
         const float size = ImGuiRTL_GetSourceSize(font, baked, i);
         const float density = ImGuiRTL_GetSourceDensity(font, baked, i);
         const FT_UInt height = (FT_UInt)(size * 64.0f * density);
-        if (ImGuiRTL_GetFaceHeight(fe, i) == height)
+
+        // Match the FreeType glyph loader's size setup exactly, so the advances/offsets we compute
+        // are at the same scale as the glyph bitmaps the loader rasterizes. Otherwise fonts whose
+        // real ascender+descender differs from their em size (e.g. Noto Naskh Arabic) would have a
+        // scale mismatch and letters would be drawn with gaps.
+        //
+        // The loader picks NOMINAL instead of REAL_DIM when ImGuiFreeTypeLoaderFlags_Bitmap is set
+        // (both to enable FreeType bitmap glyphs and to select a matching bitmap strike). We must
+        // mirror that per source, otherwise the loader rasterizes at one size while we measure at
+        // another -- the same failure mode as above, measured at ~4.8px per glyph at 23px for
+        // Noto Naskh Arabic with the flag on.
+        const bool request_nominal = (font->Sources[i]->FontLoaderFlags & ImGuiFreeTypeLoaderFlags_Bitmap) != 0;
+
+        // Cache key for "already sized": height in 26.6, plus the low bit for the request type.
+        // The low bit is safe because 'height' is always a multiple of 64 (size * 64 * density),
+        // so it never uses bit 0. Toggling the Bitmap flag would otherwise early-out and silently
+        // keep a face sized with the other request type.
+        const FT_UInt height_key = height | (request_nominal ? 1u : 0u);
+        if (ImGuiRTL_GetFaceHeight(fe, i) == height_key)
             continue;
 
-        // Match the FreeType glyph loader's size setup exactly (REAL_DIM + rasterizer
-        // density), so the advances/offsets we compute are at the same scale as the glyph
-        // bitmaps the loader rasterizes. Otherwise fonts whose real ascender+descender
-        // differs from their em size (e.g. Noto Naskh Arabic) would have a scale mismatch
-        // and letters would be drawn with gaps.
         FT_Size_RequestRec req;
-        req.type = FT_SIZE_REQUEST_TYPE_REAL_DIM;
+        req.type = request_nominal ? FT_SIZE_REQUEST_TYPE_NOMINAL : FT_SIZE_REQUEST_TYPE_REAL_DIM;
         req.width = 0;
         req.height = height;
         req.horiResolution = 0;
         req.vertResolution = 0;
         if (FT_Request_Size(face, &req) != 0)
             return false;
-        ImGuiRTL_GetFaceHeight(fe, i) = height;
+        ImGuiRTL_GetFaceHeight(fe, i) = height_key;
     }
     return true;
 }
@@ -620,6 +657,15 @@ static bool ImGuiRTL_ShapeText(ImFont* font, ImFontBaked* baked, const char* tex
             out.SourceIdx = (fe != NULL) ? ImGuiRTL_GlyphSourceIndex(fe, raqm_glyphs[i].ftface) : 0;
             out.Codepoint = (ImWchar)ImGuiRTL_DecodeCodepointAt(text_begin, text_end, cluster);
             out.XAdvance  = (float)raqm_glyphs[i].x_advance / 64.0f / g_density;
+            out.XAdvance += ImGuiRTL_GetSourceExtraAdvance(font, baked, out.SourceIdx);
+            // Bake per-source letter-spacing (ImFontConfig::GlyphExtraAdvanceX) so shaped text honors
+            // it exactly like the codepoint path does in ImFontAtlasBakedAddFontGlyph(). The scale
+            // matches that function's 'offsets_scale': the value is stored as an absolute for the
+            // first source's size, so it is scaled by this source's relative size (and by the
+            // source's ExtraSizeScale, folded into ImGuiRTL_GetSourceSize()).
+            // We deliberately do NOT apply GlyphMinAdvanceX/GlyphMaxAdvanceX or PixelSnapH here:
+            // forcing a minimum advance would break Arabic cursive joins, and snapping to whole
+            // pixels would discard the fractional GPOS positioning the shaper exists to preserve.
             out.YAdvance  = -(float)raqm_glyphs[i].y_advance / 64.0f / g_density; // HarfBuzz is Y-up, ImGui is Y-down.
             out.XOffset   = (float)raqm_glyphs[i].x_offset / 64.0f / g_density;
             out.YOffset   = -(float)raqm_glyphs[i].y_offset / 64.0f / g_density;   // HarfBuzz is Y-up, ImGui is Y-down.

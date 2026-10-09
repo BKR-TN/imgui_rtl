@@ -6934,9 +6934,14 @@ ImFontGlyph* ImFontAtlasBakedAddFontGlyph(ImFontAtlas* atlas, ImFontBaked* baked
 
 // Add a glyph loaded by font glyph index (rather than by codepoint). Used by text shaping backends:
 // shaped glyphs (contextual Arabic forms, ligatures) have no meaningful single codepoint, so they are
-// only reachable through their glyph index. Unlike ImFontAtlasBakedAddFontGlyph() we deliberately do not
-// clamp/snap/space the advance here: positioning is driven by the shaper, which supplies its own advances
-// and offsets.
+// only reachable through their glyph index.
+// Unlike ImFontAtlasBakedAddFontGlyph() we deliberately do not clamp/snap/space the advance here.
+// Positioning is driven by the shaper: every shaped consumer (measure, render, wrap, caret) takes its
+// advance from ImFontShapedGlyphAdvance() -> ImShapedGlyph::XAdvance, not from glyph->AdvanceX, so
+// GlyphMinAdvanceX/GlyphMaxAdvanceX and PixelSnapH intentionally do not apply to shaped text. (Applying
+// the minimum would break Arabic cursive joins, and snapping would discard fractional GPOS placement.)
+// GlyphExtraAdvanceX, being presentation rather than font design, IS honoured -- baked into XAdvance by
+// the shaper. See misc/rtl/DESIGN.md section 5.
 ImFontGlyph* ImFontAtlasBakedAddFontGlyphByIndex(ImFontAtlas* atlas, ImFontBaked* baked, const ImFontGlyph* in_glyph)
 {
     int glyph_idx = baked->Glyphs.Size;

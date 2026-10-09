@@ -259,7 +259,9 @@ size the shaper uses must be *exactly* the same FreeType size the loader uses.
 ImGui's FreeType loader requests a size with:
 
 ```c
-FT_Request_Size(face, { FT_SIZE_REQUEST_TYPE_REAL_DIM, 0, size * 64 * density, 0, 0 });
+const bool nominal = (src->FontLoaderFlags & ImGuiFreeTypeLoaderFlags_Bitmap) != 0;
+FT_Request_Size(face, { nominal ? FT_SIZE_REQUEST_TYPE_NOMINAL : FT_SIZE_REQUEST_TYPE_REAL_DIM,
+                        0, size * 64 * density, 0, 0 });
 ```
 
 (`REAL_DIM` is important: it sizes by the real ascender+descender, not the em square.
@@ -268,8 +270,12 @@ the wrong request type makes the shaper's advances disagree with the bitmaps —
 letters draw with visible gaps.)
 
 The shaper must therefore do the *identical* request (`ImGuiRTL_EnsureFacesSized`),
-including the `density` factor (`baked->RasterizerDensity * src->RasterizerDensity`),
-otherwise every glyph is subtly the wrong scale.
+including the `density` factor (`baked->RasterizerDensity * src->RasterizerDensity`)
+**and the per-source `Bitmap` conditional**, otherwise every glyph is subtly the wrong
+scale. The shaper includes `imgui_freetype.h` purely to read that flag; it is a deliberate
+coupling, because the sizing policy lives in the loader while the shaper needs the identical
+policy. (If a second shaper backend ever lands, consider having the core expose the loader's
+chosen size instead.)
 
 ### The Y-direction sign flip
 
@@ -291,9 +297,11 @@ documented here so the next person doesn't re-derive them.
 quickest way to confirm a scale mismatch on a new font (Noto Naskh Arabic: 26ppem NOMINAL vs
 15ppem REAL_DIM).
 
-> Note: the FreeType loader uses `NOMINAL` instead of `REAL_DIM` when
-> `ImGuiFreeTypeLoaderFlags_Bitmap` is set. The shaper always requests `REAL_DIM`, so bitmap
-> fonts sized that way would need the same conditional to stay in sync.
+> The `Bitmap` conditional above was a real bug, not a hypothetical one: the shaper used to
+> always request `REAL_DIM`, so with `ImGuiFreeTypeLoaderFlags_Bitmap` set the loader baked a
+> 12.0px advance for a glyph the shaper measured at 7.2px (Noto Naskh Arabic at 23px — a 4.8px
+> disagreement per glyph, i.e. the gaps bug returning). The selftest now asserts that the
+> shaper's advance matches the loader's under both settings.
 
 ### A second, subtler cause of gaps: hinting breaks cursive joins
 
@@ -312,6 +320,30 @@ The fix is to rasterize Arabic with **light hinting**
 (`ImFontConfig::FontLoaderFlags = ImGuiFreeTypeLoaderFlags_LightHinting`), which snaps
 glyphs only vertically. Horizontal metrics stay unhinted, the advances agree with the
 bitmaps, and the joins stay closed. The demo loads Noto Naskh Arabic this way.
+
+### Which ImFontConfig advance knobs apply to shaped text
+
+Four `ImFontConfig` fields affect advances in the codepoint path
+(`ImFontAtlasBakedAddFontGlyph`). They are deliberately *not* treated alike on the shaped
+path, because they mean two different things:
+
+- **`GlyphExtraAdvanceX` is applied.** It is documented as "extra spacing (in pixels)
+  between glyphs" — a presentation setting, orthogonal to script. Letter-spacing and RTL
+  text are independent requests, so silently ignoring it for Arabic while honouring it for
+  Latin in the same UI was a bug. `ImGuiRTL_ShapeText` bakes it into `ImShapedGlyph::XAdvance`
+  per source (`ImGuiRTL_GetSourceExtraAdvance`), using the same `baked->Size / Sources[0]->SizePixels`
+  scale the codepoint path uses. Baking it into the advance — rather than post-adjusting
+  positions — means measure, render, wrap and caret geometry all see the same value
+  automatically, so they cannot disagree.
+- **`GlyphMinAdvanceX` / `GlyphMaxAdvanceX` are ignored.** They are documented as font-design
+  knobs ("set Min to align font icons, set both Min/Max to enforce mono-space font"). Forcing a
+  minimum advance on cursive Arabic would push joined letters apart and **break the joins** —
+  destroying the thing this add-on exists to do.
+- **`PixelSnapH` is ignored.** The shaper holds fractional advances on purpose; Arabic GPOS
+  mark positioning depends on them. Snapping would reintroduce the gaps class of bug.
+
+The selftest asserts the `GlyphExtraAdvanceX` behaviour (expected width = glyph count × extra)
+and, for the metrics above, that the shaper and loader agree under both `Bitmap` settings.
 
 ---
 

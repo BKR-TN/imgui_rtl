@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_rtl.h"
+#include "imgui_freetype.h"   // ImGuiFreeTypeLoaderFlags_Bitmap (loader size-request regression test)
 
 #include <stdio.h>
 #include <string.h>
@@ -879,6 +880,133 @@ int main(int argc, char** argv)
                      first_font_gid, test_n, ref_n, ref_gids[0], test_gids[0]);
             Check(same, "font removal + re-add does not reuse a stale FT_Face (matches fresh reference)", detail);
         }
+    }
+
+    // (10) Letter-spacing (ImFontConfig::GlyphExtraAdvanceX) must reach shaped text, exactly like it
+    //      reaches the codepoint path. Regression: every shaped consumer (measure/render/wrap/caret)
+    //      takes its advance from the shaper, so the config used to be silently ignored for shaped
+    //      text while still working for Latin text in the same UI.
+    {
+        const char* ar_txt = ar;
+        const char* ar_end = ar_txt + strlen(ar_txt);
+
+        // Each variant uses its own context; the suite's context is recreated afterwards because a
+        // later test (8) still needs a live context with fonts. The glyph count is measured in the
+        // fresh context too: the suite's own font/baked handles are stale by this point (earlier
+        // tests rebuild contexts), and per-glyph spacing multiplies by the *shaped* glyph count,
+        // which is not one per byte.
+        float w_plain = 0.0f;
+        int cluster_count = 0;
+        {
+            ImGui::DestroyContext();
+            ImGui::CreateContext();
+            ImGuiIO& ioe = ImGui::GetIO();
+            ioe.DisplaySize = ImVec2(640, 480);
+            ImFontConfig cfge;
+            cfge.OversampleH = cfge.OversampleV = 1;
+            ImFont* fe = ioe.Fonts->AddFontFromFileTTF(font_path, 22.0f, &cfge);
+            ioe.Fonts->Build();
+            if (fe != NULL)
+            {
+                ImFontBaked* be = fe->GetFontBaked(22.0f);
+                w_plain = fe->CalcTextSizeA(22.0f, FLT_MAX, 0.0f, ar_txt, ar_end).x;
+                const ImShapedGlyph* g = NULL; int n = 0, d = 0;
+                if (shaper->ShapeText(fe, be, ar_txt, ar_end, &g, &n, &d))
+                    cluster_count = n;
+            }
+        }
+
+        float w_extra = 0.0f;
+        {
+            ImGui::DestroyContext();
+            ImGui::CreateContext();
+            ImGuiIO& ioe = ImGui::GetIO();
+            ioe.DisplaySize = ImVec2(640, 480);
+            ImFontConfig cfge;
+            cfge.OversampleH = cfge.OversampleV = 1;
+            cfge.GlyphExtraAdvanceX = 2.0f;
+            ImFont* fe = ioe.Fonts->AddFontFromFileTTF(font_path, 22.0f, &cfge);
+            ioe.Fonts->Build();
+            if (fe != NULL)
+                w_extra = fe->CalcTextSizeA(22.0f, FLT_MAX, 0.0f, ar_txt, ar_end).x;
+        }
+
+        // Restore a usable context with the suite's font so test (8) can still run.
+        ImGui::DestroyContext();
+        ImGui::CreateContext();
+        ImGuiIO& iom = ImGui::GetIO();
+        iom.DisplaySize = ImVec2(640, 480);
+        ImFontConfig cfgm;
+        cfgm.OversampleH = cfgm.OversampleV = 1;
+        iom.Fonts->AddFontFromFileTTF(font_path, 22.0f, &cfgm);
+        iom.Fonts->Build();
+
+        // The word must grow by (glyphs x 2.0px), matching how the codepoint path applies the same
+        // setting per glyph. A small tolerance absorbs the fractional advances.
+        const float expected = w_plain + 2.0f * (float)cluster_count;
+        char ls_detail[192];
+        snprintf(ls_detail, sizeof(ls_detail), "Arabic width %.2f -> %.2f (expected %.2f = %d shaped glyphs x 2.0px)",
+                 w_plain, w_extra, expected, cluster_count);
+        Check(cluster_count > 0 && w_plain > 0.0f && ImFabs(w_extra - expected) < 0.05f,
+              "GlyphExtraAdvanceX (letter-spacing) is applied to shaped text", ls_detail);
+    }
+
+    // (11) The shaper must issue the same FT_Request_Size() type as the FreeType loader. That loader
+    //      switches to NOMINAL when ImGuiFreeTypeLoaderFlags_Bitmap is set, while the shaper used to
+    //      always request REAL_DIM -- desyncing the two scales by ~4.8px per glyph at 23px.
+    {
+        for (int variant = 0; variant < 2; variant++)
+        {
+            const bool bitmap_flag = (variant == 1);
+            ImGui::DestroyContext();
+            ImGui::CreateContext();
+            ImGuiIO& ioc = ImGui::GetIO();
+            ioc.DisplaySize = ImVec2(640, 480);
+            // U+00E9 is non-ASCII (so the shaper accepts it) and has no kerning/ligature, making its
+            // shaped advance directly comparable to the advance the loader baked for it.
+            ImGuiRTL::SetSimpleScriptFastPath(false);
+            ImFontConfig cfgc;
+            cfgc.OversampleH = cfgc.OversampleV = 1;
+            if (bitmap_flag)
+                cfgc.FontLoaderFlags |= ImGuiFreeTypeLoaderFlags_Bitmap;
+            ImFont* fc = ioc.Fonts->AddFontFromFileTTF(font_path, 23.0f, &cfgc);
+            ioc.Fonts->Build();
+
+            float shaped_adv = 0.0f, loader_adv = 0.0f;
+            bool ok_adv = false;
+            if (fc != NULL)
+            {
+                ImFontBaked* bc = fc->GetFontBaked(23.0f);
+                const char* one = "\xC3\xA9";
+                int d = 0;
+                if (ImFontShapedCalcLineMetrics(fc, bc, 23.0f, one, one + 2, &shaped_adv, &d))
+                {
+                    loader_adv = bc->GetCharAdvance((ImWchar)0xE9);
+                    ok_adv = true;
+                }
+            }
+            ImGuiRTL::SetSimpleScriptFastPath(true);
+
+            char adv_detail[192];
+            snprintf(adv_detail, sizeof(adv_detail), "Bitmap=%d: loader %.3f vs shaper %.3f (delta %+.3f)",
+                     (int)bitmap_flag, loader_adv, shaped_adv, shaped_adv - loader_adv);
+            // Tolerance covers the loader's integer advance rounding; a scale disagreement measured
+            // ~4.8px before the fix, so this would catch a regression.
+            Check(ok_adv && ImFabs(shaped_adv - loader_adv) < 1.0f,
+                  bitmap_flag ? "shaper metrics match the loader with ImGuiFreeTypeLoaderFlags_Bitmap"
+                              : "shaper metrics match the loader without ImGuiFreeTypeLoaderFlags_Bitmap",
+                  adv_detail);
+        }
+
+        // Restore a usable context (see above).
+        ImGui::DestroyContext();
+        ImGui::CreateContext();
+        ImGuiIO& iom = ImGui::GetIO();
+        iom.DisplaySize = ImVec2(640, 480);
+        ImFontConfig cfgm;
+        cfgm.OversampleH = cfgm.OversampleV = 1;
+        iom.Fonts->AddFontFromFileTTF(font_path, 22.0f, &cfgm);
+        iom.Fonts->Build();
     }
 
     printf("\n=== Regression tests: %d/%d passed ===\n", GTestCount - GTestFailures, GTestCount);

@@ -368,6 +368,14 @@ Other Changes:
     `ImGuiInputTextState::CaretAffinity` (internal) to disambiguate bidi dual-caret positions.
   - [FORK/RTL] RTL `Text()`, `Selectable()` labels and `InputText()` are right-aligned
     automatically; `ImGuiRTL::AlignTextRight()` is available for custom widgets.
+  - [FORK/RTL] Fixed `ImFontConfig::GlyphExtraAdvanceX` (letter-spacing) being silently ignored
+    for shaped text while still applying to Latin text in the same UI. Presentation options are
+    honoured; font-design ones (`GlyphMinAdvanceX`/`GlyphMaxAdvanceX`, `PixelSnapH`) intentionally
+    are not, because they would break cursive joins / fractional GPOS placement.
+  - [FORK/RTL] Fixed shaper/loader font-size desync when `ImGuiFreeTypeLoaderFlags_Bitmap` is used:
+    the FreeType loader switches to `FT_SIZE_REQUEST_TYPE_NOMINAL` for that flag, so the shaper now
+    mirrors it per source instead of always requesting `REAL_DIM` (previously a ~4.8px per glyph
+    metric disagreement, i.e. the "gaps" bug, for e.g. Noto Naskh Arabic at 23px).
   - [FORK/RTL] Rebased onto the reworked index-based `ImFontLoader`: the fork's
     `ImFontLoader::FontBakedLoadGlyphByIndex()` hook was removed, since `FontBakedLoadGlyph()`
     is itself glyph-index based upstream. Custom `ImFontLoader` implementations therefore do

@@ -87,10 +87,15 @@ static void TextWithSelection(ImFont* font, const char* text, int sel_begin_byte
     base_x = ImGuiRTL::AlignTextRight(pos.x, ImGui::GetCurrentWindow()->WorkRect.Max.x, text, text_end, -1.0f);
 #endif
 
+    // Highlight the selection. Two strategies, in order:
+    //  1. the shaper's per-run segments, because a bidi selection can be several disjoint runs
+    //     (this is how InputText renders its selection too);
+    //  2. otherwise a single span between the two endpoint x offsets.
+    // A -1 from GetSelectionSegments means "not supported for this text" (e.g. pure ASCII), which
+    // is exactly when the endpoint span should be used.
+    bool selection_drawn = false;
     if (shaper != NULL && shaper->GetSelectionSegments != NULL && baked != NULL && sel_begin_byte < sel_end_byte)
     {
-        // Draw one highlight rect per visual segment (a bidi selection can be several
-        // disjoint runs). Matches how InputText now renders its selection highlight.
         enum { SEL_MAX_SEGMENTS = 32 };
         float segments[SEL_MAX_SEGMENTS * 2];
         const int n = shaper->GetSelectionSegments(cur_font, baked, text, text_end, sel_begin_byte, sel_end_byte, segments, SEL_MAX_SEGMENTS);
@@ -104,9 +109,10 @@ static void TextWithSelection(ImFont* font, const char* text, int sel_begin_byte
                     ImVec2(base_x + lo, pos.y), ImVec2(base_x + hi, pos.y + font_size),
                     IM_COL32(58, 114, 190, 150));
             }
+            selection_drawn = true;
         }
     }
-    else if (shaper != NULL && shaper->IndexToXOffset != NULL && baked != NULL && sel_begin_byte < sel_end_byte)
+    if (!selection_drawn && shaper != NULL && shaper->IndexToXOffset != NULL && baked != NULL && sel_begin_byte < sel_end_byte)
     {
         const float x1 = shaper->IndexToXOffset(cur_font, baked, text, text_end, sel_begin_byte, -1);
         const float x2 = shaper->IndexToXOffset(cur_font, baked, text, text_end, sel_end_byte, -1);
@@ -147,7 +153,7 @@ static const ImWchar* GetRtlGlyphRanges(ImFontAtlas* atlas)
 }
 
 // Arabic-only glyph ranges (for merging an Arabic font onto a Latin base font).
-static const ImWchar* GetArabicGlyphRanges(ImFontAtlas* atlas)
+static const ImWchar* GetArabicGlyphRanges()
 {
     static ImVector<ImWchar> ranges;
     if (ranges.empty())
@@ -227,12 +233,18 @@ int main(int argc, char** argv)
         ImFontConfig base_cfg;
         base_cfg.OversampleH = base_cfg.OversampleV = 2;
         merged_font = io.Fonts->AddFontFromFileTTF(latin_font_path, 28.0f, &base_cfg, io.Fonts->GetGlyphRangesDefault());
-
-        ImFontConfig merge_cfg;
-        merge_cfg.OversampleH = merge_cfg.OversampleV = 2;
-        merge_cfg.MergeMode = true;
-        merge_cfg.FontLoaderFlags = ImGuiFreeTypeLoaderFlags_LightHinting;
-        io.Fonts->AddFontFromFileTTF(arabic_font_path, 28.0f, &merge_cfg, GetArabicGlyphRanges(io.Fonts));
+        if (merged_font == NULL)
+        {
+            fprintf(stderr, "[rtl_demo] failed to load Latin base font \"%s\"; merged-font example disabled.\n", latin_font_path);
+        }
+        else
+        {
+            ImFontConfig merge_cfg;
+            merge_cfg.OversampleH = merge_cfg.OversampleV = 2;
+            merge_cfg.MergeMode = true;
+            merge_cfg.FontLoaderFlags = ImGuiFreeTypeLoaderFlags_LightHinting;
+            io.Fonts->AddFontFromFileTTF(arabic_font_path, 28.0f, &merge_cfg, GetArabicGlyphRanges());
+        }
     }
 
     // Debug toggle: render with shaping disabled to compare against the shaped output.
@@ -255,10 +267,10 @@ int main(int argc, char** argv)
         ImGui::NewFrame();
 
         {
-        char buf[128];
-            sprintf(buf, "FPS (معدل الإطارات): %.2f | Frame Time: %.3f ms", io.Framerate, 1000.0f / ImGui::GetIO().Framerate);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "FPS (معدل الإطارات): %.2f | Frame Time: %.3f ms", io.Framerate, 1000.0f / ImGui::GetIO().Framerate);
             ImGui::Begin("RTL / Arabic shaping demo");
-            ImGui::Text(buf);
+            ImGui::Text("%s", buf);
             ImGui::Separator();
 
             ImGui::PushFont(arabic_font);

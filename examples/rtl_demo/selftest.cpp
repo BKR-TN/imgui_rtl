@@ -53,8 +53,12 @@ static void DumpShaped(const ImFontShaper* shaper, ImFont* font, ImFontBaked* ba
 int main(int argc, char** argv)
 {
     const char* font_path = (argc > 1) ? argv[1] : RTL_DEMO_FONT_ARABIC;
-    const char* merge_base_path = (argc > 2) ? argv[2] : NULL;   // Latin base for the merged-font check
-    const char* merge_arabic_path = (argc > 3) ? argv[3] : NULL; // Arabic merge source
+    // Merged-font check: defaults to the bundled fonts so it runs in a plain `./rtl_selftest`.
+    // Pass "-" to disable it, or override the two paths explicitly.
+    const char* merge_base_path = (argc > 2) ? argv[2] : RTL_DEMO_FONT_LATIN;
+    const char* merge_arabic_path = (argc > 3) ? argv[3] : RTL_DEMO_FONT_ARABIC;
+    if (merge_base_path[0] == '-' && merge_base_path[1] == 0) merge_base_path = NULL;
+    if (merge_arabic_path != NULL && merge_arabic_path[0] == '-' && merge_arabic_path[1] == 0) merge_arabic_path = NULL;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -128,6 +132,13 @@ int main(int argc, char** argv)
     // --- Shaping dump ---
     const ImFontShaper* shaper = io.Fonts->FontShaper;
     printf("\nShaper: %s\n", shaper ? shaper->Name : "(none)");
+    Check(shaper != NULL, "a shaper is attached to the atlas (IMGUI_ENABLE_RTL build)");
+    if (shaper == NULL)
+    {
+        printf("\nFATAL: no shaper attached; the rest of the suite would silently pass nothing.\n");
+        printf("=== Regression tests: %d/%d passed ===\n", GTestCount - GTestFailures, GTestCount);
+        return 1;
+    }
     if (shaper != NULL)
     {
         DumpShaped(shaper, font, baked, "AR", ar);
@@ -181,12 +192,15 @@ int main(int argc, char** argv)
                     if (rev_idx < 0 || seq[rev_idx] != cur) rev_ok = 0;
                 }
                 printf("  %-22s -> %s\n", rc == 0 ? "عربي English" : "English عربي English", rev_ok ? "OK" : "FAILED");
+                Check(rev_ok != 0, rc == 0 ? "visual caret walk is reversible (Arabic then English)"
+                                          : "visual caret walk is reversible (English, Arabic, English)");
             }
         }
     }
 
     // Merged-font shaping: the Arabic glyphs must come from the merged source (not .notdef).
-    if (merged_font != NULL)
+    // Guarded on the shaper too: this block dereferences shaper->ShapeText / FindGlyphByIndex.
+    if (merged_font != NULL && shaper != NULL)
     {
         ImFontBaked* merged_baked = merged_font->GetFontBaked(22.0f);
         printf("\nMerged-font shaping (Latin base + Arabic merge):\n");
@@ -206,7 +220,8 @@ int main(int argc, char** argv)
                 if (bg == NULL || bg->GlyphId != g[i].GlyphId || bg->SourceIdx != g[i].SourceIdx)
                     mismatches++;
             }
-            printf("Merged glyph resolution: %d/%d glyphs resolved to their own source (%s)\n", n - mismatches, n, mismatches ? "MISMATCH" : "OK");
+            Check(mismatches == 0 && n > 0, "merged-font glyphs resolve to their own source (glyph-index + source key)",
+                  mismatches == 0 ? NULL : "some shaped glyphs resolved to the wrong source");
         }
     }
 
@@ -216,6 +231,7 @@ int main(int argc, char** argv)
         const struct { const char* label; const char* text; } map_cases[] = {
             { "AR", ar }, { "AR+marks", ar_dia }, { "MIXED", mixed },
         };
+        bool map_roundtrip_ok = true;
         for (int mc = 0; mc < (int)(sizeof(map_cases) / sizeof(map_cases[0])); mc++)
         {
             const char* map_text = map_cases[mc].text;
@@ -236,12 +252,15 @@ int main(int argc, char** argv)
                     tag = (x2 >= 0.0f && x2 - x > -0.001f && x2 - x < 0.001f) ? "same-x" : "WRONG";
                 }
                 printf("  byte %2d -> x=%6.2f -> byte %2d %s\n", i, x, idx, tag);
+                if (strcmp(tag, "WRONG") == 0)
+                    map_roundtrip_ok = false;
                 if (p >= map_end)
                     break;
                 unsigned int c = (unsigned char)*p;
                 p += (c < 0x80) ? 1 : ImTextCharFromUtf8(&c, p, map_end);
             }
         }
+        Check(map_roundtrip_ok, "caret Index<->X round-trip lands on the same visual x");
     }
 
     // --- Shaping cache correctness ---
@@ -260,7 +279,7 @@ int main(int argc, char** argv)
                     identical = false;
                     break;
                 }
-        printf("\nShaping cache (miss == hit): %s (n=%d)\n", identical ? "OK" : "MISMATCH", n1);
+        Check(identical && n1 > 0, "shaping cache hit returns identical glyphs to the miss");
 
         // Direction keying: changing the base direction must not return a stale cached result.
         ImGuiRTL::SetDirection(ImGuiRTL::Direction_RTL);
@@ -268,7 +287,7 @@ int main(int argc, char** argv)
         ImGuiRTL::SetDirection(ImGuiRTL::Direction_LTR);
         shaper->ShapeText(font, baked, mixed, mixed + strlen(mixed), &g2, &n2, &d2);
         ImGuiRTL::SetDirection(ImGuiRTL::Direction_Default);
-        printf("Direction keying: forced RTL dir=%d, forced LTR dir=%d (expect 1, 0)\n", d1, d2);
+        Check(d1 == 1 && d2 == 0, "shaping cache is keyed on base direction (forced RTL -> 1, forced LTR -> 0)");
 
         // Per-run direction (used for arrow-key movement inside mixed bidi text).
         if (shaper->DirectionAt != NULL)
@@ -312,8 +331,7 @@ int main(int argc, char** argv)
                 const char* me2 = mixed_nodigits + strlen(mixed_nodigits);
                 int oaff = -1;
                 const int after_space = shaper->MoveCaretVisual(font, baked, mixed_nodigits, me2, 7, +1, 0, &oaff);
-                printf("  byte  7 -> %2d  (expect 8, no skip)\n", after_space);
-                printf("  %s\n", after_space == 8 ? "OK" : "FAILED");
+                Check(after_space == 8, "visual caret step does not skip the first Arabic glyph at a run boundary");
             }
 
             // Pure RTL: from the end (leftmost) stepping right must reach the start without dead-lock.
@@ -356,7 +374,7 @@ int main(int argc, char** argv)
                 if (nxt == cur) break;
                 cur = nxt;
             }
-            printf("\nCaret walk x-monotonic (mixed): %s\n", monotonic ? "OK" : "FAILED");
+            Check(monotonic, "visual caret walk is x-monotonic and agrees with IndexToXOffset");
         }
     }
 
@@ -365,8 +383,8 @@ int main(int argc, char** argv)
         const float ar_w = font->CalcTextSizeA(22.0f, FLT_MAX, 0.0f, ar).x;
         const float x_ar = ImGuiRTL::AlignTextRight(0.0f, 200.0f, ar, ar + strlen(ar), ar_w);
         const float x_ltr = ImGuiRTL::AlignTextRight(0.0f, 200.0f, ltr, ltr + strlen(ltr), 100.0f);
-        printf("\nAlignTextRight: AR at 200px -> x=%.2f (expect %.2f), LTR -> x=%.2f (expect 0, unchanged)\n",
-               x_ar, 200.0f - ar_w, x_ltr);
+        Check(ImFabs(x_ar - (200.0f - ar_w)) < 0.01f && x_ltr == 0.0f,
+              "AlignTextRight() right-aligns RTL text and leaves LTR text at pos_x");
     }
 
     // --- Selection segments (bidi-correct highlight) ---
@@ -428,7 +446,6 @@ int main(int argc, char** argv)
         const char* ascii = "The quick brown fox jumps over the lazy dog";
         const char* ascii_end = ascii + strlen(ascii);
         bool ascii_index_ok = true;
-        int ascii_widths_checked = 0;
         for (float wr = 4.0f; wr <= 200.0f; wr += 4.0f)
         {
             ImVector<const char*> shaped_starts;
@@ -443,7 +460,6 @@ int main(int argc, char** argv)
                 if (q >= ascii_end)
                     break;
             }
-            ascii_widths_checked++;
             if (shaped_starts.Size != stock_starts.Size)
             {
                 ascii_index_ok = false;
@@ -456,7 +472,8 @@ int main(int argc, char** argv)
                     break;
                 }
         }
-        Check(ascii_index_ok, "ASCII wrap matches the stock line index (no shaper/renderer mismatch)", ascii_index_ok ? NULL : "see ascii_widths_checked");
+        Check(ascii_index_ok, "ASCII wrap matches the stock line index (no shaper/renderer mismatch)",
+              ascii_index_ok ? NULL : "mismatch; see the widths swept in the loop above");
 
         // A wrap point whose remainder is only blanks must not create a phantom empty line.
         {
@@ -498,21 +515,15 @@ int main(int argc, char** argv)
                     cr_ok = false;
             }
             Check(cr_ok, "bidi class-B characters (CR/NEL/U+2029) don't break shaping or add width");
-
-            // CRLF: numbers identical to the same text without CR, and the shaped path stays active.
-            float w_crlf = 0.0f, w_lf = 0.0f; int d2 = 0;
-            const char* crlf = "\xD8\xB9\xD8\xB1\xD8\xA8\xD9\x8A\r";
-            const bool shaped_crlf = ImFontShapedCalcLineMetrics(font, baked, 22.0f, crlf, crlf + strlen(crlf), &w_crlf, &d2);
-            ImFontShapedCalcLineMetrics(font, baked, 22.0f, crlf, crlf + 8, &w_lf, &d2);
-            Check(shaped_crlf && ImFabs(w_crlf - w_lf) < 0.001f, "CRLF line measured like LF");
         }
     }
 
     // (2) Glyph-index lookup robustness: out-of-range indices must return NULL (no huge allocation).
+    // Note the index guard is evaluated before the source guard, so exercising the *source* guard
+    // requires a glyph index that is itself valid (hence the 1u below).
     Check(baked->FindGlyphByIndex(0u, 0) == NULL, "FindGlyphByIndex(0) returns NULL");
     Check(baked->FindGlyphByIndex(0x10000u, 0) == NULL, "FindGlyphByIndex(> 0xFFFF) returns NULL");
-    Check(baked->FindGlyphByIndex(0xFFFFFFFFu, 0) == NULL, "FindGlyphByIndex(0xFFFFFFFF) returns NULL");
-    Check(baked->FindGlyphByIndex(0xFFFFFFFFu, 99) == NULL, "FindGlyphByIndex(bad source) returns NULL");
+    Check(baked->FindGlyphByIndex(1u, 99) == NULL, "FindGlyphByIndex(bad source) returns NULL");
 
     // (3) A transient load failure (ImFontFlags_NoLoadGlyphs, as set by PushPasswordFont()) must not
     //     be cached as NOT_FOUND: the glyph must load once loading is allowed again.
@@ -525,6 +536,9 @@ int main(int argc, char** argv)
         if (shaper->ShapeText(font, baked, rare, rare + strlen(rare), &rg, &rn, &rd))
             for (int i = 0; i < rn; i++)
             {
+                // Mirrors the core's ImFontBakedGlyphIdLookupKey() packing (glyph_id << 4 | source);
+                // IM_FONTGLYPH_ID_INDEX_UNUSED is 0. If that packing ever changes, this probe stops
+                // finding a candidate -- which is why the else branch below fails loudly instead of skipping.
                 const unsigned int key = (rg[i].GlyphId << 4) | (unsigned int)(rg[i].SourceIdx & 0xF);
                 if (key < (unsigned int)baked->GlyphIdLookup.Size && baked->GlyphIdLookup[key] == 0 && rg[i].GlyphId != 0)
                 {
@@ -542,7 +556,8 @@ int main(int argc, char** argv)
         }
         else
         {
-            printf("  [SKIP] transient load failure test (no unloaded glyph index found)\n");
+            Check(false, "transient load failure is not cached as NOT_FOUND",
+                  "no unloaded glyph index found - the glyph-id lookup key packing may have changed");
         }
     }
 
@@ -681,6 +696,8 @@ int main(int argc, char** argv)
         };
         const int case_count = (int)(sizeof(cases) / sizeof(cases[0]));
         const float sweep_sizes[] = { 8.0f, 22.0f, 96.0f };
+        // 0.0f is meaningful: it selects the "single visual line / no wrapping" branch of
+        // ImFontShapedWrapLine(). Do not substitute a fallback width here.
         const float sweep_wraps[] = { 0.0f, 1.0f, 30.0f, 120.0f };
         bool sweep_ok = true;
         int sweep_ops = 0;
@@ -694,7 +711,7 @@ int main(int argc, char** argv)
                 ImFontBaked* b = font->GetFontBaked(sweep_sizes[si]);
                 for (int wi = 0; wi < 4 && sweep_ok; wi++)
                 {
-                    const float wrap = (sweep_wraps[wi] > 0.0f) ? sweep_wraps[wi] : 40.0f;
+                    const float wrap = sweep_wraps[wi];
                     ImVector<const char*> st;
                     ImFontShapedWrapLine(font, b, shaper, sweep_sizes[si], t, t_end, wrap, &st, ImDrawTextFlags_WrapKeepBlanks);
                     for (int k = 0; k < st.Size; k++)

@@ -117,10 +117,20 @@ if(RAQM_SOURCE_DIR STREQUAL "")
     set(RAQM_SOURCE_DIR "${libraqm_SOURCE_DIR}")
 endif()
 
-set(RAQM_VERSION_MAJOR 0)
-set(RAQM_VERSION_MINOR 11)
-set(RAQM_VERSION_MICRO 0)
-set(RAQM_VERSION "0.11.0")
+# libraqm generates raqm-version.h from its meson project version. Read it from the checkout we
+# actually use, so a local checkout of a different version doesn't get misreported as the pinned one.
+file(READ "${RAQM_SOURCE_DIR}/meson.build" RAQM_MESON_BUILD)
+if(RAQM_MESON_BUILD MATCHES "version[ \t]*:[ \t]*'([0-9]+\\.[0-9]+\\.[0-9]+)'")
+    set(RAQM_VERSION "${CMAKE_MATCH_1}")
+else()
+    set(RAQM_VERSION "0.11.0") # fallback: the version pinned by FetchContent below
+    message(WARNING "imgui RTL: could not parse libraqm version from ${RAQM_SOURCE_DIR}/meson.build; assuming ${RAQM_VERSION}")
+endif()
+string(REPLACE "." ";" RAQM_VERSION_LIST "${RAQM_VERSION}")
+list(GET RAQM_VERSION_LIST 0 RAQM_VERSION_MAJOR)
+list(GET RAQM_VERSION_LIST 1 RAQM_VERSION_MINOR)
+list(GET RAQM_VERSION_LIST 2 RAQM_VERSION_MICRO)
+message(STATUS "imgui RTL: libraqm ${RAQM_VERSION} from '${RAQM_SOURCE_DIR}'")
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/raqm-gen)
 configure_file(
@@ -174,6 +184,10 @@ if(RTL_BUILD_SELFTEST)
     add_executable(rtl_selftest selftest.cpp)
     target_link_libraries(rtl_selftest PRIVATE imgui)
     target_compile_definitions(rtl_selftest PRIVATE RTL_DEMO_FONT_DIR="${RTL_DEMO_FONT_DIR}")
+
+    # Register with CTest so `ctest` (or `ctest --output-on-failure`) runs the suite.
+    enable_testing()
+    add_test(NAME rtl_selftest COMMAND rtl_selftest)
 endif()
 
 # Headless benchmark (RTL shaping vs LTR)

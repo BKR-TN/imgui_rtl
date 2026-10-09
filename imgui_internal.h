@@ -1345,7 +1345,7 @@ struct IMGUI_API ImGuiInputTextState
     bool                    ValidatedThisFrame;
     bool                    WantReloadUserBuf;      // force a reload of user buf so it may be modified externally. may be automatic in future version.
     ImS8                    LastMoveDirectionLR;    // ImGuiDir_Left or ImGuiDir_Right. track last movement direction so when cursor cross over a word-wrapping boundaries we can display it on either line depending on last move.s
-    ImS8                    StbCaretAffinity;        // 0 = trailing (attach to previous char), 1 = leading (attach to next char), -1 = unknown. Disambiguates bidi dual-caret positions.
+    ImS8                    CaretAffinity;        // 0 = trailing (attach to previous char), 1 = leading (attach to next char), -1 = unknown. Disambiguates bidi dual-caret positions.
     int                     ReloadSelectionStart;
     int                     ReloadSelectionEnd;
 
@@ -3985,7 +3985,7 @@ struct ImShapedGlyph
     float           YAdvance;       // Vertical advance in pixels (0 for horizontal text)
     float           XOffset;        // Horizontal offset from pen position (GPOS/mark positioning)
     float           YOffset;        // Vertical offset from pen position
-    unsigned int    Cluster;        // UTF-8 byte offset of the cluster start, relative to text_begin (informational only)
+    unsigned int    Cluster;        // UTF-8 byte offset of the cluster start, relative to text_begin. Used to map wrap positions and caret stops back to logical offsets.
 };
 
 // Text shaping backend. Default is NULL (no shaping: text is rendered LTR, one codepoint = one glyph).
@@ -4073,9 +4073,10 @@ struct ImFontLoader
     bool            (*FontBakedInit)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src);
     void            (*FontBakedDestroy)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src);
     // Load a glyph by font glyph index. The codepoint path resolves the index through
-    // FontSrcGetGlyphIndexFromCodepoint() or the user remap hook, then calls this. Text shaping
-    // backends call it directly, which is what makes it possible to reach glyphs that have no
-    // single meaningful codepoint (contextual Arabic forms, ligatures).
+    // FontSrcGetGlyphIndexFromCodepoint() or the user remap hook, then calls this. The core's
+    // glyph-index path (ImFontBaked::FindGlyphByIndex() -> ImFontBaked_BuildLoadGlyphByIndex())
+    // calls it too, with an index the shaper resolved, which is what makes it possible to reach
+    // glyphs that have no single meaningful codepoint (contextual Arabic forms, ligatures).
     bool            (*FontBakedLoadGlyph)(ImFontAtlas* atlas, ImFontConfig* src, ImFontBaked* baked, void* loader_data_for_baked_src, int glyph_index, ImFontGlyph* out_glyph, float* out_advance_x); // Required
 
     // Size of backend data, Per Baked * Per Source. Buffers are managed by core to avoid excessive allocations.

@@ -33,7 +33,10 @@ speed (~0.1us instead of ~30us per unique string).
 
 - `imgui_rtl.h` / `imgui_rtl.cpp` — the `ImFontShaper` implementation + helpers.
 - `DESIGN.md` — the full design & implementation journey (the *why* behind every piece).
-- `tools/` — standalone diagnostics (`render_dump`, `raqm_metrics_test`, `raqm_cursor_test`, `ft_size_test`).
+- `tools/` — standalone diagnostics (`render_dump`, `raqm_metrics_test`, `raqm_cursor_test`,
+  `ft_size_test`). These are **not** part of the CMake build; they were used to investigate
+  FreeType sizing and RAQM cluster/caret behaviour, and are handy when debugging a new font.
+  See [Tools](#tools) for how to compile them.
 - `examples/rtl_demo/CMakeLists.txt` — the build (imgui library + demo + self-test + benchmark).
 - `examples/rtl_demo/benchmark.cpp` — headless RTL vs LTR text benchmark.
 
@@ -41,12 +44,36 @@ Core Dear ImGui changes (all gated; LTR behavior is unchanged when no shaper is 
 
 - `ImFontGlyph::GlyphId` + `ImFontBaked::FindGlyphByIndex()` — glyph-index lookup,
   required because shaped glyphs (contextual forms, ligatures) have no single codepoint.
-- `ImFontLoader::FontBakedLoadGlyphByIndex()` — implemented for both the FreeType
-  and stb_truetype loaders.
+  Backed by the core `ImFontBaked_BuildLoadGlyphByIndex()` and
+  `ImFontAtlasBakedAddFontGlyphByIndex()` (the latter deliberately skips the advance
+  clamp/snap that the codepoint path applies, since the shaper supplies its own positioning).
+  The `ImFontLoader` side needs no fork-specific entry point: upstream's
+  `FontBakedLoadGlyph()` is already glyph-index based, so both the FreeType and stb_truetype
+  loaders serve the codepoint path and the shaping path through the same callback.
 - `ImFontShaper` interface + `ImFontAtlas::SetFontShaper()`.
 - Optional shaping path in `ImFontCalcTextSizeEx()` and `ImFont::RenderText()`.
   Pure-ASCII text is routed to the original LTR path even when a shaper is attached, so
   plain Latin text has no measurable overhead and behaves byte-for-byte like stock Dear ImGui.
+- Shaping-aware word wrap and helpers exported to `imgui_internal.h`:
+  `ImFontShapedWrapLine()`, `ImFontShapedCalcLineMetrics()`, `ImFontShapedGetGlyphAdvance()`
+  (the last one lets a shaper compute caret/selection geometry that matches what is drawn,
+  password masking and control characters included).
+- `ImGuiInputTextState::CaretAffinity` (internal) — disambiguates the two visual positions a
+  bidi dual-caret byte offset can map to.
+
+### Upstream merge
+
+This fork tracks upstream and was merged with dear imgui `2859f6723`. That upstream batch
+reworked `ImFontLoader` so `FontBakedLoadGlyph()` takes a raw **glyph index** instead of a
+codepoint, and added `FontSrcGetGlyphIndexFromCodepoint()` plus an index-based
+`FontSrcContainsGlyph()`. Because that subsumes what the fork previously added as its own
+`ImFontLoader::FontBakedLoadGlyphByIndex()` hook, that hook was **removed** and the shaping
+path was rebased onto upstream's API — so custom `ImFontLoader` implementations do *not* need
+to provide any fork-specific callback. Upstream separately added
+`ImFont::AddRemapCodepointToGlyphIndex()` (a codepoint-keyed remap table for reaching
+unmapped glyphs); the shaper does not use it, since it addresses shaped glyphs directly by
+glyph index. The only remaining delta in `misc/freetype/imgui_freetype.cpp` is populating
+`ImFontGlyph::GlyphId`.
 
 ## Build
 
@@ -61,15 +88,23 @@ cmake --build build
 (or `cd examples/rtl_demo && cmake -B build && cmake --build build`, which keeps the build
 directory inside the example folder).
 
+The self-test is registered with CTest, so a full build can be verified with:
+
+```sh
+ctest --test-dir build --output-on-failure
+```
+
 HarfBuzz, SheenBidi and libraqm are used from a local checkout when present, and
 otherwise fetched automatically with `FetchContent` (pinned versions:
-HarfBuzz `14.4.0`, SheenBidi `v3.0.0`, libraqm `v0.11.0`). FreeType and GLFW are
-system dependencies.
+HarfBuzz `14.5.0`, SheenBidi `v3.0.0`, libraqm `v0.11.0`). FreeType and GLFW are
+system dependencies. When a local libraqm checkout is used, its version is read from its
+own `meson.build` rather than assumed to be the pinned one.
 
 Options:
 
 - `RTL_BUILD_DEMO` (default ON) — build the GLFW/OpenGL3 demo (`examples/rtl_demo/main.cpp`).
-- `RTL_BUILD_SELFTEST` (default ON) — build the headless self-test (`examples/rtl_demo/selftest.cpp`).
+- `RTL_BUILD_SELFTEST` (default ON) — build the headless self-test (`examples/rtl_demo/selftest.cpp`)
+  and register it with CTest.
 - `RTL_BUILD_BENCHMARK` (default ON) — build the headless benchmark (`examples/rtl_demo/benchmark.cpp`).
 
 ## Usage
@@ -130,6 +165,41 @@ is undefined at compile time):
 Pure-ASCII text is routed to the original LTR path (≈1.0x overhead), while Arabic
 and mixed text pay the expected shaping cost (roughly 100–300x for a proper Arabic
 font, inherent to HarfBuzz bidi+shaping).
+
+## Tools
+
+`tools/` holds four standalone diagnostics. They are deliberately outside the CMake build
+(they are experiment scaffolding, not shipped code), and need the already-built dependencies,
+so run them **after** a normal build. From the repository root:
+
+```sh
+# Needs only FreeType: shows why REAL_DIM sizing is required. Prints metrics for
+# FT_Set_Char_Size (NOMINAL, the pre-fix behaviour) vs FT_Request_Size(REAL_DIM), which is
+# what the shaper and the FreeType loader actually use. For Noto Naskh Arabic the two
+# disagree badly (26ppem vs 15ppem), which is the origin of the original "gaps" bug.
+gcc -o /tmp/ft_size_test misc/rtl/tools/ft_size_test.c $(pkg-config --cflags --libs freetype2)
+
+# Need libraqm + FreeType: dump RAQM's glyph metrics / caret stops for a font.
+RAQM="-Iexamples/rtl_demo/build/_deps/libraqm-src/src -Iexamples/rtl_demo/build/raqm-gen"
+LIBS="examples/rtl_demo/build/libraqm.a
+      examples/rtl_demo/build/_deps/harfbuzz-build/libharfbuzz.a
+      examples/rtl_demo/build/_deps/sheenbidi-build/libSheenBidi.a
+      $(pkg-config --libs freetype2 glib-2.0 fribidi)"
+gcc -o /tmp/raqm_metrics_test misc/rtl/tools/raqm_metrics_test.c $RAQM $(pkg-config --cflags freetype2) $LIBS -lm
+gcc -o /tmp/raqm_cursor_test  misc/rtl/tools/raqm_cursor_test.c  $RAQM $(pkg-config --cflags freetype2) $LIBS -lm
+
+# Needs the imgui library: dumps the exact per-glyph draw positions of the shaped render path.
+g++ -std=gnu++14 -DIMGUI_ENABLE_FREETYPE -DIMGUI_ENABLE_RTL -DNDEBUG -I. -Imisc/rtl -Imisc/freetype \
+    $(pkg-config --cflags freetype2) misc/rtl/tools/render_dump.cpp \
+    examples/rtl_demo/build/libimgui.a $LIBS -o /tmp/render_dump -lpthread -ldl -lm
+
+/tmp/render_dump examples/rtl_demo/fonts/NotoNaskhArabic.ttf 26
+```
+
+Note: `raqm_cursor_test` probes libraqm's own `raqm_index_to_position` /
+`raqm_position_to_index`. The shaper does **not** use those (see its header comment and
+`DESIGN.md` §8) — it builds a cached caret-stop list from the shaped glyphs instead. That tool is
+kept only as an upstream-raqm probe.
 
 ## Shaping cache
 

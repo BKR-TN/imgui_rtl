@@ -1,14 +1,42 @@
+// Probe of libraqm's own cursor-mapping APIs (raqm_index_to_position / raqm_position_to_index).
+//
+// NOTE: the shaper does NOT use these. It was tried and abandoned: the three raqm-based mappings
+// disagreed with each other in mixed bidi text, and XOffsetToIndex ended up re-running raqm_layout()
+// per call. The shaper instead builds a cached caret-stop list from the shaped glyphs
+// (ImGuiRTL_BuildCaretStops() in imgui_rtl.cpp); see misc/rtl/DESIGN.md section 8.
+//
+// Kept as a standalone probe of upstream raqm behaviour when investigating caret issues.
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 #include <raqm.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+// Match the sizing the shaper and the FreeType loader use (REAL_DIM), so the metrics dumped
+// here are on the same scale as what the pipeline actually computes.
+static void ft_set_size_real_dim(FT_Face face, float size_px)
+{
+    FT_Size_RequestRec req;
+    req.type = FT_SIZE_REQUEST_TYPE_REAL_DIM;
+    req.width = 0;
+    req.height = (FT_UInt)(size_px * 64.0f);
+    req.horiResolution = 0;
+    req.vertResolution = 0;
+    FT_Request_Size(face, &req);
+}
+
 int main(int argc, char** argv)
 {
+    if (argc < 2)
+    {
+        fprintf(stderr, "usage: %s font.ttf\n", argv[0]);
+        return 1;
+    }
+
     FT_Library lib; FT_Init_FreeType(&lib);
     FT_Face face; FT_New_Face(lib, argv[1], 0, &face);
-    FT_Set_Char_Size(face, 0, 22 * 64, 0, 72);
+    ft_set_size_real_dim(face, 22.0f);
 
     raqm_t* rq = raqm_create();
     const char* text = "\xD8\xA7\xD9\x84\xD8\xB3\xD9\x84\xD8\xA7\xD9\x85 \xD8\xB9\xD9\x84\xD9\x8A\xD9\x83\xD9\x85"; // السلام عليكم

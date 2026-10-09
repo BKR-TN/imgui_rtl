@@ -7416,10 +7416,6 @@ float ImFontShapedGetGlyphAdvance(ImFontBaked* baked, const ImShapedGlyph& sg)
     return ImFontShapedGlyphAdvance(baked, sg);
 }
 
-// Per-cluster cumulative widths of a shaped run, so "width of the logical prefix [0, byte_offset)"
-// is a binary search instead of re-summing all glyphs for every candidate wrap position.
-// Note: glyphs are in visual order, so clusters are not sorted; we sort them (insertion sort, as
-// cluster counts are small and visual order is nearly logical order).
 // Per-byte cumulative widths of a shaped run, so "width of the logical prefix [0, byte_offset)" is
 // an O(1) array lookup instead of re-summing glyphs for every candidate wrap position.
 // (Glyphs are in visual order, so their clusters are not sorted; indexing by byte offset sidesteps

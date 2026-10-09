@@ -4331,7 +4331,7 @@ static void STB_TEXTEDIT_DELETECHARS(ImGuiInputTextState* obj, int pos, int n)
     memmove(dst, src, obj->TextLen - n - pos + 1);
     obj->EditedBefore = obj->EditedThisFrame = true;
     obj->TextLen -= n;
-    obj->StbCaretAffinity = -1; // Editing invalidates the bidi dual-caret side the caret was on.
+    obj->CaretAffinity = -1; // Editing invalidates the bidi dual-caret side the caret was on.
 }
 
 static int STB_TEXTEDIT_INSERTCHARS(ImGuiInputTextState* obj, int pos, const char* new_text, int new_text_len)
@@ -4363,7 +4363,7 @@ static int STB_TEXTEDIT_INSERTCHARS(ImGuiInputTextState* obj, int pos, const cha
     obj->EditedBefore = obj->EditedThisFrame = true;
     obj->TextLen += new_text_len;
     obj->TextA[obj->TextLen] = '\0';
-    obj->StbCaretAffinity = -1; // Editing invalidates the bidi dual-caret side the caret was on.
+    obj->CaretAffinity = -1; // Editing invalidates the bidi dual-caret side the caret was on.
 
     return new_text_len;
 }
@@ -4418,7 +4418,7 @@ ImGuiInputTextState::ImGuiInputTextState()
     memset((void*)this, 0, sizeof(*this));
     Stb = IM_NEW(ImStbTexteditState);
     memset(Stb, 0, sizeof(*Stb));
-    StbCaretAffinity = -1; // unknown: no known bidi caret side yet.
+    CaretAffinity = -1; // unknown: no known bidi caret side yet.
 }
 
 ImGuiInputTextState::~ImGuiInputTextState()
@@ -4484,7 +4484,7 @@ static bool InputTextMoveCursorVisual(ImGuiContext& g, ImGuiInputTextState* stat
         InputTextGetCaretLine(state, &line_start, &line_end);
         const int cursor_rel = (int)(state->Stb->cursor - (line_start - state->TextA.Data));
         int target_affinity = -1;
-        const int target_rel = shaper->MoveCaretVisual(g.Font, g.FontBaked, line_start, line_end, cursor_rel, visual_dir, state->StbCaretAffinity, &target_affinity);
+        const int target_rel = shaper->MoveCaretVisual(g.Font, g.FontBaked, line_start, line_end, cursor_rel, visual_dir, state->CaretAffinity, &target_affinity);
         if (target_rel < 0)
             return false; // not handled (pure ASCII / non-boundary): fall back to stb
         if (target_rel == cursor_rel)
@@ -4525,7 +4525,7 @@ static bool InputTextMoveCursorVisual(ImGuiContext& g, ImGuiInputTextState* stat
             state->CursorFollow = true;
             state->CursorAnimReset();
             state->LastMoveDirectionLR = (visual_dir > 0) ? ImGuiDir_Right : ImGuiDir_Left;
-            state->StbCaretAffinity = (ImS8)target_affinity;
+            state->CaretAffinity = (ImS8)target_affinity;
             return true;
         }
     }
@@ -4967,7 +4967,7 @@ static ImVec2 InputTextLineIndexGetPosOffset(ImGuiContext& g, ImGuiInputTextStat
     const ImFontShaper* shaper = (g.Font != NULL) ? g.Font->OwnerAtlas->FontShaper : NULL;
     float shaped_x = -1.0f;
     if (shaper != NULL && shaper->IndexToXOffset != NULL && g.FontBaked != NULL)
-        shaped_x = shaper->IndexToXOffset(g.Font, g.FontBaked, line_start, line_end, (int)(cursor_ptr - line_start), (state != NULL) ? state->StbCaretAffinity : -1);
+        shaped_x = shaper->IndexToXOffset(g.Font, g.FontBaked, line_start, line_end, (int)(cursor_ptr - line_start), (state != NULL) ? state->CaretAffinity : -1);
     if (shaped_x >= 0.0f)
         offset.x = shaped_x;
     else
@@ -5080,7 +5080,7 @@ static bool InputTextShapedClick(ImGuiContext& g, ImGuiInputTextState* state, fl
         state->Stb->has_preferred_x = 0;
     }
     state->LastMoveDirectionLR = ImGuiDir_Left;
-    state->StbCaretAffinity = -1; // unknown: a click's bidi side isn't tracked here.
+    state->CaretAffinity = -1; // unknown: a click's bidi side isn't tracked here.
     return true;
 }
 
@@ -5122,7 +5122,7 @@ static bool InputTextShapedMoveVertical(ImGuiContext& g, ImGuiInputTextState* st
         goal_x = state->Stb->preferred_x;
     else
     {
-        goal_x = shaper->IndexToXOffset(g.Font, g.FontBaked, line_start, line_end, cursor_n - (int)(line_start - text), state->StbCaretAffinity);
+        goal_x = shaper->IndexToXOffset(g.Font, g.FontBaked, line_start, line_end, cursor_n - (int)(line_start - text), state->CaretAffinity);
         if (goal_x < 0.0f)
             return false;
     }
@@ -5156,7 +5156,7 @@ static bool InputTextShapedMoveVertical(ImGuiContext& g, ImGuiInputTextState* st
     state->Stb->has_preferred_x = 1;
     state->Stb->preferred_x = goal_x;
     state->LastMoveDirectionLR = ImGuiDir_Left;
-    state->StbCaretAffinity = -1; // unknown after a vertical move.
+    state->CaretAffinity = -1; // unknown after a vertical move.
     return true;
 }
 

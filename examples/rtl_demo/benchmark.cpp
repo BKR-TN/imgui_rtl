@@ -108,7 +108,10 @@ int main(int argc, char** argv)
         for (int mode = 0; mode < 2; mode++)
         {
             const bool enabled = (mode == 0);
-            io.Fonts->FontShaper = enabled ? shaper : NULL;
+            // Use the setter rather than assigning the member: it also latches FontShaperExplicit,
+            // so a later atlas build cannot silently re-attach the compile-time default shaper and
+            // turn the "LTR" column into RTL.
+            io.Fonts->SetFontShaper(enabled ? shaper : NULL);
 
             // Warm-up (also preloads glyphs); clear the cache so it doesn't leave a populated cache.
             for (int i = 0; i < 200; i++)
@@ -177,6 +180,9 @@ int main(int argc, char** argv)
     printf("  - 'cache RTL' is the cost of a cache HIT (the 2nd+ call to the same text in one\n");
     printf("    frame). Compare it to 'measure RTL' to see how much the shaping cache saves\n");
     printf("    for repeated labels.\n");
+    printf("  - 'cache LTR' is NOT the same quantity: with no shaper there is no shaping cache,\n");
+    printf("    so that column only measures ImGui's own IndexAdvanceX lookup. It is the floor\n");
+    printf("    that 'cache RTL' is trying to approach, not a comparable shaped number.\n");
     (void)sink;
 
     ImGui::DestroyContext();

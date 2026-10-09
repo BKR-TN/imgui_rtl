@@ -7,7 +7,12 @@
 
 int main(int argc, char** argv)
 {
-    const char* font_path = (argc > 1) ? argv[1] : "fonts/NotoNaskhArabic.ttf";
+    if (argc < 2)
+    {
+        fprintf(stderr, "usage: %s font.ttf [size_px]\n", argv[0]);
+        return 1;
+    }
+    const char* font_path = argv[1];
     float font_size = (argc > 2) ? (float)atof(argv[2]) : 26.0f;
 
     IMGUI_CHECKVERSION();
@@ -15,14 +20,22 @@ int main(int argc, char** argv)
     ImGuiIO& io = ImGui::GetIO();
 
     ImFont* font = io.Fonts->AddFontFromFileTTF(font_path, font_size, NULL);
-    if (!font) { fprintf(stderr, "font load failed\n"); return 1; }
+    if (!font) { fprintf(stderr, "font load failed: %s\n", font_path); return 1; }
     io.Fonts->Build();
 
     ImFontBaked* baked = font->GetFontBaked(font_size);
     printf("baked: size=%.1f ascent=%.2f descent=%.2f\n", baked->Size, baked->Ascent, baked->Descent);
 
+    // No shaper means there is no shaped render path to dump (this tool builds with
+    // IMGUI_ENABLE_RTL, so a NULL shaper indicates the backend failed to attach).
     const ImFontShaper* shaper = io.Fonts->FontShaper;
     printf("shaper: %s\n", shaper ? shaper->Name : "(none)");
+    if (shaper == NULL || shaper->ShapeText == NULL)
+    {
+        fprintf(stderr, "no shaper attached: nothing to dump (is this built with IMGUI_ENABLE_RTL?)\n");
+        ImGui::DestroyContext();
+        return 1;
+    }
 
     const char* samples[] = {
         "بِسْمِ",                       // bismi (kasra marks)
@@ -37,8 +50,8 @@ int main(int argc, char** argv)
         const char* end = text + strlen(text);
         const ImShapedGlyph* g = NULL;
         int n = 0, dir = 0;
-        bool ok = shaper->ShapeText(font, baked, text, end, &g, &n, &dir);
-        printf("\n=== '%s' dir=%s n=%d ===\n", samples[s], dir ? "RTL" : "LTR", n);
+        const bool ok = shaper->ShapeText(font, baked, text, end, &g, &n, &dir);
+        printf("\n=== '%s' dir=%s n=%d%s ===\n", samples[s], dir ? "RTL" : "LTR", n, ok ? "" : " SHAPE-FAILED");
 
         float x = 0.0f;
         for (int i = 0; i < n; i++)

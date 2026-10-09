@@ -36,6 +36,7 @@ stock Dear ImGui with no extra dependencies**.
 13. Compile-time gating and "no deps when disabled"
 14. Known limitations and likely bugs
 15. The journey, in the order it actually happened
+16. Post-review fixes
 
 ---
 
@@ -75,9 +76,10 @@ result is "kind of works, mostly broken":
 4. **No 1:1 codepoint↔glyph mapping.** This is the one that breaks ImGui's whole
    glyph-cache model and is explained in section 4.
 
-5. **Glyph-index vs codepoint for the rasterizer.** ImGui rasterizes glyphs *by
-   codepoint*. A shaped glyph (a contextual form, a ligature, a decomposed mark) has
-   **no single codepoint**. So a second, parallel lookup is required (section 4).
+5. **Glyph-index vs codepoint for the rasterizer.** ImGui's glyph *cache* is keyed
+   by codepoint (`IndexLookup` / `FindGlyph(codepoint)`). A shaped glyph (a contextual
+   form, a ligature, a decomposed mark) has **no single codepoint**. So a second,
+   parallel, index-keyed lookup is required (section 4).
 
 6. **Logical↔visual coordinate mapping for editing.** A caret sits *between two bytes*
    in the logical string, but is drawn *at a visual x position*. The two are not
@@ -170,8 +172,10 @@ This is the single most important decision. It means:
 
 ImGui's glyph cache (`ImFontBaked`) is indexed by **Unicode code point**:
 `FindGlyph(codepoint)` → `ImFontGlyph`. Every glyph is keyed by the code point that
-produced it, and its raster is fetched through the loader's
-`FontBakedLoadGlyph(codepoint)`.
+produced it. The codepoint path resolves a glyph index with
+`FontSrcGetGlyphIndexFromCodepoint()` and fetches the raster through the loader's
+`FontBakedLoadGlyph(glyph_index)` (a glyph index, not a codepoint — see the merge
+note below).
 
 Shaping breaks that assumption. A shaped run contains glyphs like:
 
@@ -211,14 +215,36 @@ folds the 4-bit `ImFontGlyph::SourceIdx` into the index (`glyph_id << 4 | source
 (`ImShapedGlyph::SourceIdx`, derived from `raqm_glyph_t.ftface`), so the renderer resolves
 each shaped glyph against the correct source.
 
-Both loaders must be able to **rasterize by glyph index**:
+Both loaders must be able to **rasterize by glyph index**. After the upstream merge this
+needs no fork-specific loader hook at all, because upstream reworked `ImFontLoader` to be
+index-based:
 
-- `ImFontLoader::FontBakedLoadGlyphByIndex(...)` is the new loader hook.
-- `imgui_draw.cpp` implements it for **stb_truetype** (`ImGui_ImplStbTrueType_FontBakedLoadGlyphByIndex`).
-- `misc/freetype/imgui_freetype.cpp` implements it for **FreeType** (`ImGui_ImplFreeType_FontBakedLoadGlyphByIndex`).
+- `ImFontLoader::FontBakedLoadGlyph(..., int glyph_index, ...)` takes a **glyph index**
+  (upstream used to take a codepoint), and `FontSrcGetGlyphIndexFromCodepoint()` does the
+  codepoint→index step the codepoint path needs. `FontSrcContainsGlyph()` is likewise
+  index-based.
+- `imgui_draw.cpp` implements it once for **stb_truetype**
+  (`ImGui_ImplStbTrueType_FontBakedLoadGlyph`), and
+  `misc/freetype/imgui_freetype.cpp` once for **FreeType**
+  (`ImGui_ImplFreeType_FontBakedLoadGlyph`). Both set `out_glyph->GlyphId`.
+- The core bridge is `ImFontBaked_BuildLoadGlyphByIndex()` (called from
+  `FindGlyphByIndex()`), which targets one explicit source, disables fallback, and calls the
+  same `FontBakedLoadGlyph()` as the codepoint path. It registers the result through
+  `ImFontAtlasBakedAddFontGlyphByIndex()` so the shaper's own advances/offsets are not
+  re-clamped or snapped.
 
-Without this, the shaped glyphs could never be pulled into the atlas, and RTL
-rendering would be impossible at all. This is the very first thing that had to exist.
+Without glyph-index addressing, the shaped glyphs could never be pulled into the atlas, and
+RTL rendering would be impossible at all. This is the very first thing that had to exist.
+
+> **Upstream merge note (upstream `2859f6723`).** The fork originally added its own
+> `ImFontLoader::FontBakedLoadGlyphByIndex()` hook plus `..._FontBakedLoadGlyphByIndex()`
+> implementations in both loaders. Upstream then made `FontBakedLoadGlyph()` itself
+> index-based, which subsumes that hook, so the fork's hook was **removed** during the merge
+> and the shaping path was rebased onto upstream's API. Custom `ImFontLoader` implementations
+> therefore do *not* need to provide a fork-specific entry point. Note that upstream also
+> added `ImFont::AddRemapCodepointToGlyphIndex()` for reaching glyphs with no codepoint via a
+> remap table; that is a separate, codepoint-keyed mechanism and the shaper does not use it
+> (shaped glyphs are addressed directly, by index).
 
 ---
 
@@ -260,6 +286,14 @@ out.YOffset  = -(float)raqm_glyphs[i].y_offset  / 64.0f / density;
 These two details — matching `FT_Request_Size` exactly, and the Y flip — are the kind
 of thing that costs hours of "why is my Arabic slightly wrong?" debugging. They are
 documented here so the next person doesn't re-derive them.
+
+`tools/ft_size_test.c` prints both request types side by side for a given font, which is the
+quickest way to confirm a scale mismatch on a new font (Noto Naskh Arabic: 26ppem NOMINAL vs
+15ppem REAL_DIM).
+
+> Note: the FreeType loader uses `NOMINAL` instead of `REAL_DIM` when
+> `ImGuiFreeTypeLoaderFlags_Bitmap` is set. The shaper always requests `REAL_DIM`, so bitmap
+> fonts sized that way would need the same conditional to stay in sync.
 
 ### A second, subtler cause of gaps: hinting breaks cursive joins
 
@@ -332,7 +366,7 @@ The shaped render path (`ImFontRenderTextShaped`) walks the text:
 - render each visual line (`ImFontShapedRenderLine`).
 
 `ImFontShapedRenderLine` shapes the visual line and draws each glyph using
-`baked->FindGlyphByIndex(sg.GlyphId)` plus its `XOffset`/`YOffset`:
+`baked->FindGlyphByIndex(sg.GlyphId, sg.SourceIdx)` plus its `XOffset`/`YOffset`:
 
 ```cpp
 float px = x + sg.XOffset * scale;
@@ -391,7 +425,8 @@ what is on screen. This is the subtle part of "word wrap works for editing".
 ### The `get_line_end` "-1" convention
 
 `ImGuiTextIndex::get_line_end(n)` returns `Offsets[n+1] - 1` (the char *before* the
-next line start). This exists so a hard-newline line excludes its trailing `\n`. For
+next line start), except for the last line where it returns `EndOffset` (there is no
+`Offsets[n+1]`). This exists so a hard-newline line excludes its trailing `\n`. For
 wrapped lines it means the line's content may include trailing spaces in some
 edge cases — a pre-existing ImGui quirk, not something the RTL code introduced, but
 worth knowing when a caret/selection looks off by one space at a wrap point.
@@ -462,7 +497,7 @@ The caret logic went through three stages, and the final one is what's in the co
 
    Each stop is tagged with an **affinity** (0 = trailing, 1 = leading, -1 = unambiguous), and
    `IndexToXOffset` / `MoveCaretVisual` take an `affinity` argument to pick the right occurrence
-   (exact match first, then the unambiguous stop, then any). `ImGuiInputTextState::StbCaretAffinity`
+   (exact match first, then the unambiguous stop, then any). `ImGuiInputTextState::CaretAffinity`
    remembers the current side, updated on every arrow-key step, so stepping into and back out of
    a dual-caret region stays consistent.
 
@@ -610,16 +645,19 @@ labels. A cache deduplicates this.
 The cache lives in `imgui_rtl.cpp`, keyed on:
 
 ```
-(BakedId, TextBegin, TextLen, TextHash, Direction)
+(Atlas, BakedId, TextBegin, TextLen, TextHash, Direction)
 ```
 
+- **`Atlas`** (`ImFontAtlas*`) is part of the key because `BakedId` is only unique
+  *within* an atlas; two atlases can hold a baked font with the same id.
 - **`BakedId`** (`ImFontBaked::BakedId`) is a stable hash of (font, size, density).
   Keying on the `baked` *pointer* would be subtly wrong: an atlas rebuild can reuse a
   heap address for a new baked object, producing a stale hit. `BakedId` avoids that.
 - **`TextBegin` + `TextLen` + `TextHash`** identify the text content. `TextHash` is an
   FNV-1a hash of the bytes and is the **authority**: if a buffer is edited in place
   (same pointer, same length, new content), the hash changes → miss. This is the
-  content-keying idea (borrowed from `rtl_text.hpp`, a simple reshaping with no postioning code which uses SheenBidi only).
+  content-keying idea, borrowed from an earlier experiment (a minimal SheenBidi-only
+  reshaping layer with no positioning code that hashed its input text the same way).
 - **`Direction`** is the paragraph direction, because `SetDirection()` changes the
   shaping result.
 
@@ -726,7 +764,8 @@ How it's achieved:
 - The `#include "misc/rtl/imgui_rtl.h"` and the `ImGuiRTL::GetShaper()` auto-attach are
   both inside `#ifdef IMGUI_ENABLE_RTL`.
 - The interface types (`ImFontShaper`, `ImShapedGlyph`, `GlyphId`, `GlyphIdLookup`,
-  `FindGlyphByIndex`, `FontBakedLoadGlyphByIndex`) are **always compiled** but are pure
+  `FindGlyphByIndex`, `ImFontShapedWrapLine`, `ImFontShapedCalcLineMetrics`,
+  `ImFontShapedGetGlyphAdvance`) are **always compiled** but are pure
   C++ definitions with zero external deps — they reference nothing from libraqm etc.
 - The shaped render/size path is always compiled, but is inert when
   `FontShaper == NULL` (which is always the case when the flag is off).
@@ -794,8 +833,9 @@ For anyone retracing this, the order mattered because each step unlocked the nex
 1. **The interface** (`ImFontShaper`, `ImShapedGlyph`, `SetFontShaper`) — the
    skeleton everything else hangs off.
 
-2. **Glyph-index loading** (`GlyphId`, `FindGlyphByIndex`, `FontBakedLoadGlyphByIndex`
-   in both loaders) — without this, no shaped glyph could enter the atlas.
+2. **Glyph-index loading** (`GlyphId`, `GlyphIdLookup`/`FindGlyphByIndex`, and the core
+   `ImFontBaked_BuildLoadGlyphByIndex()` on top of upstream's index-based
+   `FontBakedLoadGlyph`) — without this, no shaped glyph could enter the atlas.
 
 3. **The shaper itself** (`imgui_rtl.cpp`, libraqm) — first correct shaping output.
 
@@ -816,7 +856,8 @@ For anyone retracing this, the order mattered because each step unlocked the nex
 
 9. **The cache** — dedup repeated shaping; hit and fixed the nested-`ImVector`
    double-free by moving to the flat glyph pool; later made it persistent and
-   content-keyed (borrowing the content-keyed idea from `rtl_text.hpp`).
+   content-keyed (borrowing the content-keyed idea from the earlier experiment
+   mentioned in section 10).
 
 10. **Right-alignment** — `AlignTextRight` for single-line, then per-line flush-right
     for wrapped text, then fixing the mouse/selection/caret to track the shift.
@@ -834,7 +875,7 @@ mapping or they drift apart.
 
 ---
 
-## 15. Post-review fixes
+## 16. Post-review fixes
 
 A follow-up review with targeted probes found and fixed the following. Kept here so the
 reasoning behind each guard is not lost:
@@ -867,7 +908,7 @@ reasoning behind each guard is not lost:
   shaper's caret stops, selection segments and line metrics still used the real advances and the
   caret drifted off the asterisks. The advance rule is shared through
   `ImFontShapedGetGlyphAdvance()`.
-- **Bidi caret affinity** (`ImGuiInputTextState::StbCaretAffinity`) is reset when the text is
+- **Bidi caret affinity** (`ImGuiInputTextState::CaretAffinity`) is reset when the text is
   inserted or deleted, so a stale dual-caret side can't be reused after an edit.
 - **Word wrap**: a line whose first cluster was wider than the wrap width was cut at byte 1
   (mid-UTF-8). The hard break is now always at a complete character, and the wrap scan uses

@@ -348,6 +348,31 @@ Other Changes:
     (#9559, #5647, #9540, #8466, #8465)
   - Added `IMGUI_DISABLE_STB_TRUETYPE` to completely omit the stb_truetype loader
     code + stb_truetype.h code. (#9573)
+  - [FORK/RTL] Added an optional `ImFontShaper` backend interface (imgui_internal.h) and
+    `ImFontAtlas::SetFontShaper()`, enabling bidirectional (RTL) and complex-script
+    (Arabic, Farsi, …) text shaping. Shaping is off by default: `FontShaper = NULL`.
+    Define `IMGUI_ENABLE_RTL` in imconfig.h to attach the bundled libraqm-based backend
+    automatically, or call `io.Fonts->SetFontShaper(ImGuiRTL::GetShaper())` at runtime.
+    Backend in `misc/rtl/`, demo/self-test/benchmark in `examples/rtl_demo/`.
+  - [FORK/RTL] Added `ImFontGlyph::GlyphId` and `ImFontBaked::FindGlyphByIndex()` so a glyph
+    can be addressed by font glyph index. Shaped glyphs (contextual Arabic forms, ligatures)
+    have no single meaningful codepoint, so this is what makes them reachable. Populated by
+    both the FreeType and stb_truetype loaders. Also added `ImFontAtlasBakedAddFontGlyphByIndex()`.
+  - [FORK/RTL] `ImFontCalcTextSizeEx()` and `ImFont::RenderText()` route non-ASCII text through
+    the shaper when one is attached, plus shaping-aware word wrap
+    (`ImFontShapedWrapLine()`, `ImFontShapedCalcLineMetrics()`, `ImFontShapedGetGlyphAdvance()`).
+    Pure-ASCII text always keeps the original LTR path, and a shaper may decline text via
+    `TextNeedsShaping()` (e.g. accented Latin), so plain Latin text is unaffected.
+  - [FORK/RTL] `InputText()` is direction-aware for bidi text (caret, mouse click/drag,
+    selection highlight, Up/Down and Left/Right/Home/End arrows). Added
+    `ImGuiInputTextState::CaretAffinity` (internal) to disambiguate bidi dual-caret positions.
+  - [FORK/RTL] RTL `Text()`, `Selectable()` labels and `InputText()` are right-aligned
+    automatically; `ImGuiRTL::AlignTextRight()` is available for custom widgets.
+  - [FORK/RTL] Rebased onto the reworked index-based `ImFontLoader`: the fork's
+    `ImFontLoader::FontBakedLoadGlyphByIndex()` hook was removed, since `FontBakedLoadGlyph()`
+    is itself glyph-index based upstream. Custom `ImFontLoader` implementations therefore do
+    NOT need to provide that hook; the shaping path goes through the same `FontBakedLoadGlyph()`
+    callback as the codepoint path. See `misc/rtl/README.md` and `misc/rtl/DESIGN.md`.
 - ColorEdit:
   - ColorButton, ColorEdit, ColorPicker: cancel-out alpha caused by BeginDisabled() so
     disabled color buttons have the same color as non-disabled oness. (#9511)

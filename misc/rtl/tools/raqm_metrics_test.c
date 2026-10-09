@@ -28,11 +28,30 @@ static void dump(const char* label, raqm_t* rq, FT_Face face, const char* utf8)
     raqm_clear_contents(rq);
 }
 
+// Match the sizing the shaper and the FreeType loader use (REAL_DIM), so the metrics dumped
+// here are on the same scale as what the pipeline actually computes.
+static void ft_set_size_real_dim(FT_Face face, float size_px)
+{
+    FT_Size_RequestRec req;
+    req.type = FT_SIZE_REQUEST_TYPE_REAL_DIM;
+    req.width = 0;
+    req.height = (FT_UInt)(size_px * 64.0f);
+    req.horiResolution = 0;
+    req.vertResolution = 0;
+    FT_Request_Size(face, &req);
+}
+
 int main(int argc, char** argv)
 {
+    if (argc < 2)
+    {
+        fprintf(stderr, "usage: %s font.ttf\n", argv[0]);
+        return 1;
+    }
+
     FT_Library lib; FT_Init_FreeType(&lib);
     FT_Face face; FT_New_Face(lib, argv[1], 0, &face);
-    FT_Set_Char_Size(face, 0, 26 * 64, 0, 72);
+    ft_set_size_real_dim(face, 26.0f);
     raqm_t* rq = raqm_create();
     dump("ra+shadda+fatha (رَّ)", rq, face, "\xD8\xB1\xD9\x91\xD9\x8E");
     dump("meem+fatha (مَ)", rq, face, "\xD9\x85\xD9\x8E");

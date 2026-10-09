@@ -940,6 +940,16 @@ reasoning behind each guard is not lost:
   shaper's caret stops, selection segments and line metrics still used the real advances and the
   caret drifted off the asterisks. The advance rule is shared through
   `ImFontShapedGetGlyphAdvance()`.
+- **Masked password rendering was ragged**: the shaped renderer substituted the fallback `*` (and
+  its advance) but still applied the shaper's per-glyph `XOffset`/`YOffset`/`YAdvance`, which
+  describe the character being *hidden* — a harakat mark sits above its base letter, a cursive form
+  is nudged sideways. Each asterisk therefore inherited an unrelated character's positioning:
+  measured on "بِسْمِ عربي", 10 distinct steps between consecutive asterisks (3.95 to 9.80px for a
+  6px `*`) and a 3.28px vertical spread. Width-only assertions could not catch it, because the total
+  masked width was unchanged. All shaped positioning now resolves through one rule,
+  `ImFontShapedGetPlacement()`, which suppresses offsets and the vertical step for masked text; the
+  selftest asserts even spacing, a single size and one baseline, and only a mark-bearing string can
+  expose a regression here (plain `عربي` has no offsets to jitter).
 - **Bidi caret affinity** (`ImGuiInputTextState::CaretAffinity`) is reset when the text is
   inserted or deleted, so a stale dual-caret side can't be reused after an edit.
 - **Word wrap**: a line whose first cluster was wider than the wrap width was cut at byte 1
@@ -965,11 +975,12 @@ reasoning behind each guard is not lost:
 ### Verification
 
 `examples/rtl_demo/selftest.cpp` is the regression suite: it dumps the shaped output and runs
-28 checks covering all of the above (glyph-index bounds and caching, password masking and its
-caret geometry, transient failures, wrap boundaries/flags/phantom lines, class-B characters,
-Home/End/Up/Down on shaped visual lines, `FontDestroyed` notifications, font removal + re-add,
-plus a malformed/unusual-input sweep at 3 sizes x 4 wrap widths). It returns a non-zero exit code
-when a check fails:
+40 checks covering all of the above (glyph-index bounds and caching, password masking and its
+caret geometry plus mask uniformity, transient failures, wrap boundaries/flags/phantom lines,
+class-B characters, Home/End/Up/Down on shaped visual lines, `FontDestroyed` notifications, font
+removal + re-add, `GlyphExtraAdvanceX` on shaped text, shaper/loader metric agreement under both
+`Bitmap` settings, plus a malformed/unusual-input sweep at 3 sizes x 4 wrap widths). It is
+registered with CTest and returns a non-zero exit code when a check fails:
 
 ```sh
 cmake -S examples/rtl_demo -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

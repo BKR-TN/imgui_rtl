@@ -372,6 +372,12 @@ Other Changes:
     for shaped text while still applying to Latin text in the same UI. Presentation options are
     honoured; font-design ones (`GlyphMinAdvanceX`/`GlyphMaxAdvanceX`, `PixelSnapH`) intentionally
     are not, because they would break cursive joins / fractional GPOS placement.
+  - [FORK/RTL] Fixed masked password rendering for shaped (RTL/complex-script) text. The shaped
+    renderer substituted the fallback '*' but still applied the shaper's per-glyph offsets, so each
+    asterisk inherited the mark/GPOS positioning of the character it replaced -- ragged spacing
+    (measured 10 distinct steps, 3.95..9.80px for a 6px '*') and a 3.28px vertical spread. Masked
+    glyphs now resolve through a single placement rule (no offsets, no vertical step), giving an
+    evenly spaced row on one baseline. Only affected the shaped path; LTR was already correct.
   - [FORK/RTL] Fixed shaper/loader font-size desync when `ImGuiFreeTypeLoaderFlags_Bitmap` is used:
     the FreeType loader switches to `FT_SIZE_REQUEST_TYPE_NOMINAL` for that flag, so the shaper now
     mirrors it per source instead of always requesting `REAL_DIM` (previously a ~4.8px per glyph

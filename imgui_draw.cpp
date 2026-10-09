@@ -7414,6 +7414,50 @@ static float ImFontShapedGlyphAdvance(ImFontBaked* baked, const ImShapedGlyph& s
     return sg.XAdvance;
 }
 
+// Positioning offsets used for one shaped glyph, in pixels at the baked size.
+// Masked (password) text must carry *no* offsets: the offsets belong to the glyph the shaper
+// resolved (a harakat mark sits above its base letter, a cursive form is nudged horizontally), and
+// applying them to the substituted '*' would give each mask glyph the vertical/horizontal jitter of
+// an unrelated character -- visually a ragged, unevenly spaced row of asterisks. The codepoint path
+// has no equivalent problem because it never applies offsets. Fonts without GPOS simply report 0.
+static void ImFontShapedGlyphOffsets(const ImFontBaked* baked, const ImShapedGlyph& sg, float* out_x, float* out_y)
+{
+    if (ImFontShapedIsMasked(baked))
+    {
+        *out_x = 0.0f;
+        *out_y = 0.0f;
+        return;
+    }
+    *out_x = sg.XOffset;
+    *out_y = sg.YOffset;
+}
+
+// Resolve the positioning of one shaped glyph, deciding *once* how a masked password maps onto the
+// fallback glyph ('*'). Keeping this in a single place is deliberate: previously the advance, the
+// offsets and the vertical step each had their own idea of what masking meant, which is how the
+// inconsistent password rendering arose. The render loop and the line-alignment pass both use it so
+// they cannot disagree about the line width.
+struct ImFontShapedPlacement
+{
+    float XAdvance;     // horizontal step to the next glyph
+    float YAdvance;     // vertical step (0 for horizontal text)
+    float XOffset;      // horizontal offset from the pen position
+    float YOffset;      // vertical offset from the pen position
+};
+
+static ImFontShapedPlacement ImFontShapedGetPlacement(const ImFontBaked* baked, const ImShapedGlyph& sg)
+{
+    ImFontShapedPlacement p;
+    p.YAdvance = sg.YAdvance;
+    ImFontShapedGlyphOffsets(baked, sg, &p.XOffset, &p.YOffset);
+    p.XAdvance = ImFontShapedGlyphAdvance(const_cast<ImFontBaked*>(baked), sg);
+    // The horizontal/vertical offsets are already masked by ImFontShapedGlyphOffsets(); a masked
+    // fallback glyph additionally has no vertical step (it is a single upright '*').
+    if (ImFontShapedIsMasked(baked))
+        p.YAdvance = 0.0f;
+    return p;
+}
+
 // Public (internal header) accessor for the same advance rule, so a shaper can compute caret and
 // selection geometry consistent with what the core draws (password masking included).
 float ImFontShapedGetGlyphAdvance(ImFontBaked* baked, const ImShapedGlyph& sg)
@@ -7879,7 +7923,7 @@ static void ImFontShapedRenderLine(ImDrawList* draw_list, ImFont* font, ImFontBa
         {
             float line_width = 0.0f;
             for (int i = 0; i < glyph_count; i++)
-                line_width += ImFontShapedGlyphAdvance(baked, glyphs[i]) * scale;
+                line_width += ImFontShapedGetPlacement(baked, glyphs[i]).XAdvance * scale;
             if (line_width < align_width)
                 x += align_width - line_width;
         }
@@ -7887,17 +7931,18 @@ static void ImFontShapedRenderLine(ImDrawList* draw_list, ImFont* font, ImFontBa
         for (int i = 0; i < glyph_count; i++)
         {
             const ImShapedGlyph& sg = glyphs[i];
-            const float glyph_advance = ImFontShapedGlyphAdvance(baked, sg) * scale;
+            const ImFontShapedPlacement pl = ImFontShapedGetPlacement(baked, sg);
+            const float glyph_advance = pl.XAdvance * scale;
             ImFontGlyph* glyph = ImFontShapedGetGlyph(baked, sg);
             if (glyph == NULL || !glyph->Visible)
             {
                 x += glyph_advance;
-                y += sg.YAdvance * scale;
+                y += pl.YAdvance * scale;
                 continue;
             }
 
-            const float px = x + sg.XOffset * scale;
-            const float py = y + sg.YOffset * scale;
+            const float px = x + pl.XOffset * scale;
+            const float py = y + pl.YOffset * scale;
             float x1 = px + glyph->X0 * scale;
             float x2 = px + glyph->X1 * scale;
             float y1 = py + glyph->Y0 * scale;
@@ -7917,7 +7962,7 @@ static void ImFontShapedRenderLine(ImDrawList* draw_list, ImFont* font, ImFontBa
                     if (y1 >= y2)
                     {
                         x += glyph_advance;
-                        y += sg.YAdvance * scale;
+                        y += pl.YAdvance * scale;
                         continue;
                     }
                 }
@@ -7927,7 +7972,7 @@ static void ImFontShapedRenderLine(ImDrawList* draw_list, ImFont* font, ImFontBa
                 draw_list->PrimRectUV(ImVec2(x1, y1), ImVec2(x2, y2), ImVec2(u1, v1), ImVec2(u2, v2), glyph_col);
             }
             x += glyph_advance;
-            y += sg.YAdvance * scale;
+            y += pl.YAdvance * scale;
         }
     }
     else

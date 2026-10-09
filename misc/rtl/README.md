@@ -242,7 +242,9 @@ Two font-loading tips that matter for Arabic:
 ## Behaviour notes
 
 - **Password fields**: masked text is substituted by the fallback glyph in the shaped path
-  too, exactly like the stock codepoint path, so non-ASCII passwords show `*`.
+  too, exactly like the stock codepoint path, so non-ASCII passwords show `*`. The mask is drawn
+  as a uniform row (evenly spaced, one baseline): the shaper's per-glyph mark/GPOS offsets are
+  suppressed for masked glyphs, since they describe the character being hidden, not the `*`.
 - **Control characters**: `\t` uses the tab glyph advance and other C0 controls are skipped,
   matching the codepoint path (a `\t` inside Arabic text no longer shifts by `.notdef`).
 - **Word wrap** only breaks at complete UTF-8 characters, and word-wrapped RTL lines are

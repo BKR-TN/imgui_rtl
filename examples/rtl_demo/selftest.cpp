@@ -609,6 +609,60 @@ int main(int argc, char** argv)
             }
             Check(v1 > v0 && real_distinct > 1, "real glyphs still render after the password font is popped (no poisoned cache)");
         }
+
+        // Masked glyphs must form a uniform row: every '*' the same size, evenly spaced, on one
+        // baseline. Regression for the shaper's per-glyph offsets being applied to the substituted
+        // fallback glyph: the shaped path renders the mask in place of the *resolved* glyph (a harakat
+        // mark sits above its base letter, a cursive form is nudged sideways), so each '*' inherited
+        // the jitter of an unrelated character. That produced ragged spacing (measured 10 distinct
+        // steps, 3.95 to 9.80, for a 6px '*') and a 3.28px vertical spread. A width-only check cannot
+        // catch this: the masked and unmasked total widths stayed equal throughout.
+        {
+            // Must use text containing marks: the jitter came from mark/GPOS offsets, so a plain
+            // string like "عربي" has no offsets and cannot expose the bug at all.
+            const char* pt_marks = ar_dia;
+            const char* pt_marks_end = pt_marks + strlen(pt_marks);
+            ImGui::PushPasswordFont();
+            draw_list._ResetForNewFrame();
+            font->RenderText(&draw_list, 22.0f, ImVec2(0.0f, 0.0f), IM_COL32_WHITE, clip, pt_marks, pt_marks_end, 0.0f, 0);
+            ImGui::PopPasswordFont();
+
+            int mask_n = 0;
+            float prev_x = 0.0f, first_x = 0.0f, last_x1 = 0.0f;
+            float step = 0.0f, glyph_w = 0.0f, base_y0 = 0.0f;
+            bool uniform_step = true, uniform_size = true, uniform_y = true;
+            for (int i = 0; i + 3 < draw_list.VtxBuffer.Size; i += 4) // one glyph quad = 4 vertices
+            {
+                const ImVec2 p0 = draw_list.VtxBuffer[i + 0].pos; // TL
+                const ImVec2 p1 = draw_list.VtxBuffer[i + 1].pos; // TR
+                const float w = p1.x - p0.x;
+                if (mask_n == 0)
+                {
+                    first_x = p0.x;
+                    glyph_w = w;
+                    base_y0 = p0.y;
+                }
+                else
+                {
+                    if (ImFabs(w - glyph_w) > 0.01f)
+                        uniform_size = false;
+                    if (ImFabs(p0.y - base_y0) > 0.01f)
+                        uniform_y = false;
+                    if (mask_n >= 2 && ImFabs((p0.x - prev_x) - step) > 0.01f)
+                        uniform_step = false;
+                    if (mask_n == 1)
+                        step = p0.x - prev_x;
+                }
+                prev_x = p0.x;
+                last_x1 = p1.x;
+                mask_n++;
+            }
+            char mask_detail[192];
+            snprintf(mask_detail, sizeof(mask_detail), "%d asterisks, w=%.2f, step=%.2f, x=[%.2f..%.2f], y0=%.2f",
+                     mask_n, glyph_w, step, first_x, last_x1, base_y0);
+            Check(mask_n > 1 && uniform_step && uniform_size && uniform_y,
+                  "masked password glyphs are uniform (even spacing, single size, one baseline)", mask_detail);
+        }
     }
 
     // (5) TextNeedsShaping: simple LTR scripts must bypass the shaping backend entirely.

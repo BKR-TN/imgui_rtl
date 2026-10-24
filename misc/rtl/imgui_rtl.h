@@ -3,8 +3,9 @@
 //
 // Usage:
 // - Link libraqm (+ harfbuzz + sheenbidi + freetype).
-// - Add '#define IMGUI_ENABLE_RTL' in your imconfig to automatically enable support,
-//   which is equivalent to selecting the default shaper with:
+// - Add '#define IMGUI_ENABLE_RTL' to automatically enable support (either in your imconfig,
+//   or from your build system as a compile definition), which is equivalent to selecting the
+//   default shaper with:
 //      io.Fonts->SetFontShaper(ImGuiRTL::GetShaper())
 // - The shaper is applied at draw/layout time, so it works with any font loaded by
 //   imgui (the raw TTF/OTF data persists for the lifetime of the atlas).

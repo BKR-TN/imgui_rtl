@@ -113,8 +113,14 @@ Option A — compile-time (like the FreeType addon):
 
 ```cpp
 // imconfig.h
-#define IMGUI_ENABLE_RTL 1
+#define IMGUI_ENABLE_RTL
 ```
+
+Or equivalently define it from your build system instead of editing `imconfig.h`
+(`-DIMGUI_ENABLE_RTL` / `/DIMGUI_ENABLE_RTL`, or
+`target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_RTL)`, which is what
+`examples/rtl_demo/CMakeLists.txt` does). The core tests it with `#ifdef`, so no value
+is needed.
 
 Then link `imgui_rtl.cpp` + libraqm (or just use the provided CMake). The shaper
 is attached to every font atlas automatically.

@@ -105,6 +105,14 @@
 //#define IMGUI_ENABLE_STB_TRUETYPE
 //#define IMGUI_DISABLE_STB_TRUETYPE
 
+//---- Use libraqm to shape bidirectional (RTL) and complex-script text (Arabic, Farsi, Indic, etc.)
+// Enables the 'misc/rtl/' addon: the shaper is attached to every font atlas, and shaping is applied at layout/draw time, so it works with any font loaded by Dear ImGui.
+// Requires program to be compiled with 'misc/rtl/imgui_rtl.cpp' (in this repository) + libraqm (not provided), which itself requires HarfBuzz, SheenBidi and FreeType.
+// The raqm headers are only needed to build imgui_rtl.cpp: the core merely includes 'misc/rtl/imgui_rtl.h', which has no external dependencies.
+// Note that imgui_rtl.cpp may be used _without_ this define, if you manually call ImFontAtlas::SetFontShaper(ImGuiRTL::GetShaper()). The define is simply a convenience.
+// See misc/rtl/README.md for details.
+//#define IMGUI_ENABLE_RTL
+
 //---- Define constructor and implicit cast operators to convert back<>forth between your math types and ImVec2/ImVec4.
 // This will be inlined as part of ImVec2 and ImVec4 class declarations.
 /*

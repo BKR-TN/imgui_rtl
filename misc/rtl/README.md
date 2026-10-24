@@ -96,7 +96,7 @@ ctest --test-dir build --output-on-failure
 
 HarfBuzz, SheenBidi and libraqm are used from a local checkout when present, and
 otherwise fetched automatically with `FetchContent` (pinned versions:
-HarfBuzz `14.5.0`, SheenBidi `v3.0.0`, libraqm `v0.11.0`). FreeType and GLFW are
+HarfBuzz `15.0.0`, SheenBidi `v3.0.0`, libraqm `v0.11.0`). FreeType and GLFW are
 system dependencies. When a local libraqm checkout is used, its version is read from its
 own `meson.build` rather than assumed to be the pinned one.
 

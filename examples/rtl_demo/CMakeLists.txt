@@ -66,7 +66,7 @@ if(NOT RTL_HARFBUZZ_DIR STREQUAL "")
 else()
     FetchContent_Declare(harfbuzz
         GIT_REPOSITORY https://github.com/harfbuzz/harfbuzz.git
-        GIT_TAG        14.5.0
+        GIT_TAG        15.0.0
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(harfbuzz)

@@ -110,6 +110,14 @@ Other Changes:
     the FreeType loader switches to `FT_SIZE_REQUEST_TYPE_NOMINAL` for that flag, so the shaper now
     mirrors it per source instead of always requesting `REAL_DIM` (previously a ~4.8px per glyph
     metric disagreement, i.e. the "gaps" bug, for e.g. Noto Naskh Arabic at 23px).
+  - [FORK/RTL] Support 24-bit font glyph indices: `IM_FONTGLYPH_ID_MAX` raised from
+    `0xFFFF` to `0xFFFFFF`, since ISO OFF (5th edition) allows 24-bit indices and HarfBuzz
+    15.0.0 enables beyond-64K glyph support by default. The glyph-id lookup is now two-tier
+    (dense array for indices <= `0xFFFF`, `ImGuiStorage` above), because the dense key is
+    `glyph_id << 4 | source`: raising the cap alone would have let a single high glyph index
+    allocate up to ~1 GB. Memory above the tier boundary is proportional to the number of
+    high glyphs actually loaded. Verified with the whole suite run twice, once with
+    `-DIM_FONTGLYPH_ID_DENSE_MAX=8` to force every glyph through the sparse tier.
   - [FORK/RTL] Rebased onto the reworked index-based `ImFontLoader`: the fork's
     `ImFontLoader::FontBakedLoadGlyphByIndex()` hook was removed, since `FontBakedLoadGlyph()`
     is itself glyph-index based upstream. Custom `ImFontLoader` implementations therefore do

@@ -3986,7 +3986,8 @@ struct ImFontBaked
 
     // [Internal] Members: Hot ~28/36 bytes (for RenderText loop)
     ImVector<ImU16>             IndexLookup;        // 12-16 // out // Sparse. Index glyphs by Unicode code-point.
-    ImVector<ImU32>             GlyphIdLookup;      // 12-16 // out // Sparse. Index glyphs by font glyph index (for text shaping). value = glyph_idx + 1; 0 == unused; 0xFFFFFFFF == not found.
+    ImVector<ImU32>             GlyphIdLookup;      // 12-16 // out // Sparse. Index glyphs by font glyph index (for text shaping), for glyph ids that fit the dense tier. value = glyph_idx + 1; 0 == unused; 0xFFFFFFFF == not found.
+    ImGuiStorage                GlyphIdLookupHigh;  // 12-16 // out // Sparse fallback for the same lookup, used for glyph ids above IM_FONTGLYPH_ID_DENSE_MAX (fonts with >64K glyphs). Rare, so keeps the dense tier small.
     ImVector<ImFontGlyph>       Glyphs;             // 12-16 // out // All glyphs.
     int                         FallbackGlyphIndex; // 4     // out // Index of FontFallbackChar
 

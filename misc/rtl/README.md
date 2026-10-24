@@ -251,6 +251,10 @@ Two font-loading tips that matter for Arabic:
   too, exactly like the stock codepoint path, so non-ASCII passwords show `*`. The mask is drawn
   as a uniform row (evenly spaced, one baseline): the shaper's per-glyph mark/GPOS offsets are
   suppressed for masked glyphs, since they describe the character being hidden, not the `*`.
+- **Fonts with more than 65535 glyphs** (24-bit glyph indices, ISO OFF 5th edition) are
+  supported: `IM_FONTGLYPH_ID_MAX` is `0xFFFFFF`. Indices above `0xFFFF` go through a sparse
+  lookup tier, so memory scales with the glyphs actually loaded rather than with the largest
+  glyph index. See `DESIGN.md` §4.
 - **Control characters**: `\t` uses the tab glyph advance and other C0 controls are skipped,
   matching the codepoint path (a `\t` inside Arabic text no longer shifts by `.notdef`).
 - **Word wrap** only breaks at complete UTF-8 characters, and word-wrapped RTL lines are

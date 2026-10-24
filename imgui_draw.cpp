@@ -3887,8 +3887,12 @@ static const ImVec2 FONT_ATLAS_DEFAULT_TEX_CURSOR_DATA[ImGuiMouseCursor_COUNT][3
 #define IM_FONTGLYPH_INDEX_NOT_FOUND        ((ImU16)-2) // 0xFFFE
 #define IM_FONTGLYPH_ID_INDEX_UNUSED        ((ImU32)0)
 #define IM_FONTGLYPH_ID_INDEX_NOT_FOUND     ((ImU32)-1) // 0xFFFFFFFF
-#define IM_FONTGLYPH_ID_MAX                 0xFFFF      // OpenType/TrueType 'numGlyphs' is a uint16 field.
+#define IM_FONTGLYPH_ID_MAX                 0xFFFFFF    // ISO Open Font Format (5th ed.) allows 24-bit glyph indices.
 #define IM_FONTGLYPH_SOURCE_IDX_MAX         0xF         // ImFontGlyph::SourceIdx is 4-bit.
+#ifndef IM_FONTGLYPH_ID_DENSE_MAX
+#define IM_FONTGLYPH_ID_DENSE_MAX           0xFFFF      // Glyph ids <= this are indexed in the dense GlyphIdLookup array. Higher ones use the sparse GlyphIdLookupHigh tier, because the dense key is (glyph_id << 4 | source) and allocating up to a 24-bit key would cost gigabytes. (Overridable for tests.)
+#endif
+#define IM_FONTGLYPH_ID_DENSE_KEY_MAX       ((ImU32)(IM_FONTGLYPH_ID_DENSE_MAX + 1) << 4) // Exclusive: keys below this live in the dense tier.
 
 // Sparse lookup key: a glyph index is only unique per source (merged fonts can reuse the same
 // glyph index in different sources), so fold the 4-bit source index into the key.
@@ -3897,6 +3901,28 @@ static inline ImU32 ImFontBakedGlyphIdLookupKey(unsigned int glyph_id, int sourc
     return (glyph_id << 4) | (ImU32)(source_idx & 0xF);
 }
 
+// Glyph-index -> (glyph slot + 1) lookup, in two tiers so that supporting 24-bit glyph ids doesn't
+// make memory proportional to the largest id: ids <= IM_FONTGLYPH_ID_DENSE_MAX (i.e. every font that
+// fits the classic 16-bit numGlyphs field) keep the original O(1) dense array, while fonts with more
+// than 64K glyphs only pay for the glyphs actually loaded. All four access sites go through these.
+static inline ImU32 ImFontBakedGlyphIdLookupGet(const ImFontBaked* baked, ImU32 key)
+{
+    if (key < IM_FONTGLYPH_ID_DENSE_KEY_MAX)
+        return (key < (ImU32)baked->GlyphIdLookup.Size) ? baked->GlyphIdLookup.Data[key] : IM_FONTGLYPH_ID_INDEX_UNUSED;
+    return (ImU32)baked->GlyphIdLookupHigh.GetInt((ImGuiID)key, (int)IM_FONTGLYPH_ID_INDEX_UNUSED);
+}
+
+static void ImFontBakedGlyphIdLookupSet(ImFontBaked* baked, ImU32 key, ImU32 value)
+{
+    if (key < IM_FONTGLYPH_ID_DENSE_KEY_MAX)
+    {
+        if (key >= (ImU32)baked->GlyphIdLookup.Size)
+            baked->GlyphIdLookup.resize(key + 1, IM_FONTGLYPH_ID_INDEX_UNUSED);
+        baked->GlyphIdLookup.Data[key] = value;
+        return;
+    }
+    baked->GlyphIdLookupHigh.SetInt((ImGuiID)key, (int)value);
+}
 
 ImFontAtlas::ImFontAtlas()
 {
@@ -5403,8 +5429,7 @@ void ImFontAtlasBakedDiscardFontGlyph(ImFontAtlas* atlas, ImFont* font, ImFontBa
     if (glyph->GlyphId != 0 && glyph->GlyphId <= IM_FONTGLYPH_ID_MAX)
     {
         const ImU32 key = ImFontBakedGlyphIdLookupKey(glyph->GlyphId, (int)glyph->SourceIdx);
-        if (key < (ImU32)baked->GlyphIdLookup.Size)
-            baked->GlyphIdLookup[key] = IM_FONTGLYPH_ID_INDEX_UNUSED;
+        ImFontBakedGlyphIdLookupSet(baked, key, IM_FONTGLYPH_ID_INDEX_UNUSED);
     }
 }
 
@@ -6819,6 +6844,7 @@ void ImFontBaked::ClearOutputData()
     IndexAdvanceX.clear();
     IndexLookup.clear();
     GlyphIdLookup.clear();
+    GlyphIdLookupHigh.Clear();
     FallbackGlyphIndex = -1;
     Ascent = Descent = 0.0f;
     MetricsTotalSurface = 0;
@@ -6873,9 +6899,7 @@ static void ImFontAtlasBakedUpdateGlyphIdLookup(ImFontBaked* baked, ImFontGlyph*
     if (glyph_id == 0 || glyph_id > IM_FONTGLYPH_ID_MAX)
         return; // 0/.notdef, or an out-of-range id from a custom font loader: nothing to index.
     const ImU32 key = ImFontBakedGlyphIdLookupKey(glyph_id, (int)glyph->SourceIdx);
-    if (key >= (unsigned int)baked->GlyphIdLookup.Size)
-        baked->GlyphIdLookup.resize(key + 1, IM_FONTGLYPH_ID_INDEX_UNUSED);
-    baked->GlyphIdLookup.Data[key] = (ImU32)((int)(glyph - baked->Glyphs.Data) + 1);
+    ImFontBakedGlyphIdLookupSet(baked, key, (ImU32)((int)(glyph - baked->Glyphs.Data) + 1));
 }
 
 ImFontGlyph* ImFontAtlasBakedAddFontGlyph(ImFontAtlas* atlas, ImFontBaked* baked, ImFontConfig* src, const ImFontGlyph* in_glyph)
@@ -7044,14 +7068,11 @@ ImFontGlyph* ImFontBaked::FindGlyphByIndex(unsigned int glyph_index, int source_
     if (source_idx < 0 || source_idx > IM_FONTGLYPH_SOURCE_IDX_MAX)
         return NULL;
     const ImU32 key = ImFontBakedGlyphIdLookupKey(glyph_index, source_idx);
-    if (key < (size_t)GlyphIdLookup.Size)
-    {
-        const ImU32 v = GlyphIdLookup.Data[key];
-        if (v == IM_FONTGLYPH_ID_INDEX_NOT_FOUND)
-            return NULL;
-        if (v != IM_FONTGLYPH_ID_INDEX_UNUSED)
-            return &Glyphs.Data[(int)v - 1];
-    }
+    const ImU32 lookup = ImFontBakedGlyphIdLookupGet(this, key);
+    if (lookup == IM_FONTGLYPH_ID_INDEX_NOT_FOUND)
+        return NULL;
+    if (lookup != IM_FONTGLYPH_ID_INDEX_UNUSED)
+        return &Glyphs.Data[(int)lookup - 1];
     ImFontGlyph* glyph = ImFontBaked_BuildLoadGlyphByIndex(this, glyph_index, source_idx);
     if (glyph == NULL)
     {
@@ -7060,11 +7081,7 @@ ImFontGlyph* ImFontBaked::FindGlyphByIndex(unsigned int glyph_index, int source_
         // poison the lookup, otherwise those glyphs would never load again. This mirrors
         // ImFontBaked_BuildLoadGlyph()'s behavior for the codepoint path.
         if (!OwnerFont->OwnerAtlas->Locked && (OwnerFont->Flags & ImFontFlags_NoLoadGlyphs) == 0)
-        {
-            if (key >= (size_t)GlyphIdLookup.Size)
-                GlyphIdLookup.resize(key + 1, IM_FONTGLYPH_ID_INDEX_UNUSED);
-            GlyphIdLookup.Data[key] = IM_FONTGLYPH_ID_INDEX_NOT_FOUND;
-        }
+            ImFontBakedGlyphIdLookupSet(this, key, IM_FONTGLYPH_ID_INDEX_NOT_FOUND);
     }
     return glyph;
 }

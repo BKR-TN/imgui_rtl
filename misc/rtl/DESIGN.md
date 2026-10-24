@@ -198,7 +198,8 @@ struct ImFontGlyph {
 
 struct ImFontBaked {
     ...
-    ImVector<ImU32> GlyphIdLookup;   // sparse: (glyph index << 4 | source) -> (glyph_idx + 1)
+    ImVector<ImU32> GlyphIdLookup;     // dense tier: (glyph index << 4 | source) -> (glyph_idx + 1)
+    ImGuiStorage    GlyphIdLookupHigh; // sparse tier, for glyph index > IM_FONTGLYPH_ID_DENSE_MAX
     ImFontGlyph* FindGlyphByIndex(unsigned int glyph_index, int source_idx);
 };
 ```
@@ -214,6 +215,35 @@ folds the 4-bit `ImFontGlyph::SourceIdx` into the index (`glyph_id << 4 | source
 `FindGlyphByIndex` takes the source. The shaper records which source produced each glyph
 (`ImShapedGlyph::SourceIdx`, derived from `raqm_glyph_t.ftface`), so the renderer resolves
 each shaped glyph against the correct source.
+
+### Why the lookup has two tiers (glyph indices are 24-bit)
+
+`IM_FONTGLYPH_ID_MAX` is `0xFFFFFF`, not `0xFFFF`. ISO **OFF (5th edition)** allows 24-bit
+glyph indices, and HarfBuzz 15.0.0 added support for them and enables the beyond-64K code
+paths by default, so "numGlyphs is a uint16 field" is no longer a valid assumption.
+
+Raising the constant alone would have been a bug rather than a fix, because the lookup key
+is `glyph_id << 4 | source`, and the original design sized a **dense** array to the largest
+key seen. Indexing a 24-bit id there would allocate up to ~1 GB
+(`0xFFFFFF << 4` entries × 4 bytes) for a single glyph, so the old `0xFFFF` cap was quietly
+doing double duty as a memory guard.
+
+The fix splits the lookup instead of raising the cap alone:
+
+- glyph indices `<= IM_FONTGLYPH_ID_DENSE_MAX` (`0xFFFF`, i.e. every font that fits the
+  classic 16-bit `numGlyphs`) use the original dense array: O(1), unchanged memory and
+  performance. This is the path for essentially every real font.
+- higher indices use `GlyphIdLookupHigh`, an `ImGuiStorage` (sorted vector + binary
+  search). Memory is proportional to the number of *high* glyphs actually loaded, not to
+  the largest id, so a pathological font can no longer cause a huge allocation.
+
+Both tiers are reached only through `ImFontBakedGlyphIdLookupGet()/Set()`, so the four
+call sites (insert, discard, find, cached-miss) cannot drift apart. The selftest asserts the
+memory property directly: requesting a very high, absent glyph index must leave the dense
+array's size unchanged. The tier boundary is overridable
+(`-DIM_FONTGLYPH_ID_DENSE_MAX=8`) so the suite can force *all* glyphs through the sparse
+path and still pass — which is how the sparse tier is actually tested without a >64K-glyph
+font.
 
 Both loaders must be able to **rasterize by glyph index**. After the upstream merge this
 needs no fork-specific loader hook at all, because upstream reworked `ImFontLoader` to be
@@ -975,12 +1005,13 @@ reasoning behind each guard is not lost:
 ### Verification
 
 `examples/rtl_demo/selftest.cpp` is the regression suite: it dumps the shaped output and runs
-40 checks covering all of the above (glyph-index bounds and caching, password masking and its
-caret geometry plus mask uniformity, transient failures, wrap boundaries/flags/phantom lines,
-class-B characters, Home/End/Up/Down on shaped visual lines, `FontDestroyed` notifications, font
-removal + re-add, `GlyphExtraAdvanceX` on shaped text, shaper/loader metric agreement under both
-`Bitmap` settings, plus a malformed/unusual-input sweep at 3 sizes x 4 wrap widths). It is
-registered with CTest and returns a non-zero exit code when a check fails:
+43 checks covering all of the above (glyph-index bounds and caching, the 24-bit index cap and
+the dense-tier allocation guard, password masking and its caret geometry plus mask uniformity,
+transient failures, wrap boundaries/flags/phantom lines, class-B characters, Home/End/Up/Down on
+shaped visual lines, `FontDestroyed` notifications, font removal + re-add, `GlyphExtraAdvanceX` on
+shaped text, shaper/loader metric agreement under both `Bitmap` settings, plus a
+malformed/unusual-input sweep at 3 sizes x 4 wrap widths). It is registered with CTest and
+returns a non-zero exit code when a check fails:
 
 ```sh
 cmake -S examples/rtl_demo -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

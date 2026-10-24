@@ -523,42 +523,59 @@ int main(int argc, char** argv)
     // Note the index guard is evaluated before the source guard, so exercising the *source* guard
     // requires a glyph index that is itself valid (hence the 1u below).
     Check(baked->FindGlyphByIndex(0u, 0) == NULL, "FindGlyphByIndex(0) returns NULL");
-    Check(baked->FindGlyphByIndex(0x10000u, 0) == NULL, "FindGlyphByIndex(> 0xFFFF) returns NULL");
+    Check(baked->FindGlyphByIndex(0x10000u, 0) == NULL, "FindGlyphByIndex(index beyond this font's glyph count) returns NULL");
+    Check(baked->FindGlyphByIndex(0x1000000u, 0) == NULL, "FindGlyphByIndex(beyond the 24-bit glyph-index max) returns NULL");
     Check(baked->FindGlyphByIndex(1u, 99) == NULL, "FindGlyphByIndex(bad source) returns NULL");
+
+    // Glyph ids are 24-bit now (OFF 5th edition). The lookup must not make memory proportional to
+    // the *id*: the dense tier is keyed by (glyph_id << 4 | source), so indexing a 24-bit id there
+    // would allocate gigabytes. Requesting a high id that the font doesn't have must therefore leave
+    // the dense array untouched (the miss is recorded in the sparse tier instead). This is the
+    // hazard the old 0xFFFF cap was really guarding against; the cap alone is no longer the defense.
+    {
+        const int dense_before = baked->GlyphIdLookup.Size;
+        Check(baked->FindGlyphByIndex(0xFFFFFEu, 0) == NULL, "FindGlyphByIndex(very high, absent id) returns NULL");
+        Check(baked->GlyphIdLookup.Size == dense_before,
+              "a high glyph index does not grow the dense glyph-id lookup (no multi-GB allocation)",
+              "dense size unchanged");
+    }
 
     // (3) A transient load failure (ImFontFlags_NoLoadGlyphs, as set by PushPasswordFont()) must not
     //     be cached as NOT_FOUND: the glyph must load once loading is allowed again.
     if (shaper != NULL)
     {
-        // Find a glyph index that is used by the text but not loaded in the atlas yet.
+        // Find a glyph used by the text that the atlas hasn't loaded yet. Deliberately behavioural
+        // (a blocked load returns NULL) instead of peeking at ImFontBaked::GlyphIdLookup: that is
+        // private storage whose layout has changed (it gained a sparse second tier for fonts with
+        // more than 64K glyphs), and an earlier version of this test broke when it did.
         unsigned int unloaded_gid = 0;
+        int unloaded_src = 0;
         const char* rare = "\xD9\x83\xD8\xB4\xD9\x85\xD8\xB4"; // "كشمش"
         const ImShapedGlyph* rg = NULL; int rn = 0, rd = 0;
-        if (shaper->ShapeText(font, baked, rare, rare + strlen(rare), &rg, &rn, &rd))
+        if (shaper->ShapeText(font, baked, rare, rare + strlen(rare), &rg, &rn, &rd) && rn > 0)
+        {
+            font->Flags |= ImFontFlags_NoLoadGlyphs;
             for (int i = 0; i < rn; i++)
-            {
-                // Mirrors the core's ImFontBakedGlyphIdLookupKey() packing (glyph_id << 4 | source);
-                // IM_FONTGLYPH_ID_INDEX_UNUSED is 0. If that packing ever changes, this probe stops
-                // finding a candidate -- which is why the else branch below fails loudly instead of skipping.
-                const unsigned int key = (rg[i].GlyphId << 4) | (unsigned int)(rg[i].SourceIdx & 0xF);
-                if (key < (unsigned int)baked->GlyphIdLookup.Size && baked->GlyphIdLookup[key] == 0 && rg[i].GlyphId != 0)
+                if (rg[i].GlyphId != 0 && baked->FindGlyphByIndex(rg[i].GlyphId, rg[i].SourceIdx) == NULL)
                 {
                     unloaded_gid = rg[i].GlyphId;
+                    unloaded_src = rg[i].SourceIdx;
                     break;
                 }
-            }
+            font->Flags &= ~ImFontFlags_NoLoadGlyphs;
+        }
         if (unloaded_gid != 0)
         {
             font->Flags |= ImFontFlags_NoLoadGlyphs;
-            ImFontGlyph* g_blocked = baked->FindGlyphByIndex(unloaded_gid, 0);
+            ImFontGlyph* g_blocked = baked->FindGlyphByIndex(unloaded_gid, unloaded_src);
             font->Flags &= ~ImFontFlags_NoLoadGlyphs;
-            ImFontGlyph* g_retry = baked->FindGlyphByIndex(unloaded_gid, 0);
+            ImFontGlyph* g_retry = baked->FindGlyphByIndex(unloaded_gid, unloaded_src);
             Check(g_blocked == NULL && g_retry != NULL, "transient load failure is not cached as NOT_FOUND");
         }
         else
         {
             Check(false, "transient load failure is not cached as NOT_FOUND",
-                  "no unloaded glyph index found - the glyph-id lookup key packing may have changed");
+                  "no unloaded glyph index found - every glyph of the sample was already loaded");
         }
     }
 

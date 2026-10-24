@@ -349,6 +349,23 @@ int main(int argc, char** argv)
             ImGui::PopFont();
 
             ImGui::Separator();
+
+            // RTL form row: a right-aligned label followed by a field on the same line. The label is
+            // drawn flush-right, so SameLine() continues the line to its LEFT (see misc/rtl/DESIGN.md
+            // section 11) instead of placing the field on top of the label. An explicit width makes the
+            // field hug the label's left edge; without it the field fills the remaining space.
+            ImGui::PushFont(arabic_font);
+            ImGui::Text("%s", "\xD8\xA7\xD8\xB3\xD9\x85\x20\xD8\xA7\xD9\x84\xD9\x85\xD8\xB3\xD8\xAA\xD8\xAE\xD8\xAF\xD9\x85\x3A"); // "اسم المستخدم:"
+            ImGui::SameLine();
+            static char username[64] = "";
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::InputText("##username", username, IM_ARRAYSIZE(username));
+            ImGui::Text("%s", "\xD9\x83\xD9\x84\xD9\x85\xD8\xA9\x20\xD8\xA7\xD9\x84\xD8\xB3\xD8\xB1\x3A"); // "كلمة السر:"
+            ImGui::SameLine();
+            ImGui::InputText("##password_row", username, IM_ARRAYSIZE(username), ImGuiInputTextFlags_Password);
+            ImGui::PopFont();
+
+            ImGui::Separator();
             DrawPassword();
 
             ImGui::End();

@@ -153,6 +153,9 @@ Text whose resolved base direction is RTL is automatically right-aligned:
 LTR and pure-ASCII text are unaffected. Use `ImGuiRTL::AlignTextRight()` to do the same in
 custom widgets.
 
+A line started by a right-aligned label continues to the left of it, so the common
+`Text(RTL label); SameLine(); <widget>;` row lays out without the widget covering the label.
+
 Note: non-wrapped multi-line `InputTextMultiline` (without `ImGuiInputTextFlags_WordWrap`) is
 right-aligned at the block level; full per-line flush-right there would require a wider
 plumbing change.
@@ -268,6 +271,12 @@ Two font-loading tips that matter for Arabic:
   HarfBuzz kerning for Latin text).
 - **`ImGui::Text()` right-alignment** applies to text that starts a line; inline RTL text
   after `SameLine()` is left where it is.
+- **`SameLine()` after a right-aligned RTL text** continues the line to the *left* of it, in
+  RTL flow, instead of placing the next item past the text's logical (LTR) advance where it
+  would cover the label. A default-width widget fills the space up to one `ItemSpacing` short
+  of the label; a widget with an explicit `SetNextItemWidth()` is placed so its right edge sits
+  there exactly. `SameLine(offset)` with an explicit offset is unchanged (absolute from the line
+  start), and after LTR text or non-text items nothing changes. See `DESIGN.md` §11.
 - **Cursor/selection**: any text the shaper accepts uses shaper-driven caret stops, so
   arrow keys move visually and skip harakat; simple LTR text keeps the stock behaviour.
 - **Font config advance options** are not all honoured on shaped text, by design:

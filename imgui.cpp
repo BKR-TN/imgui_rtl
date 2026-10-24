@@ -8254,6 +8254,7 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
         window->DC.CurrLineSize = window->DC.PrevLineSize = ImVec2(0.0f, 0.0f);
         window->DC.CurrLineTextBaseOffset = window->DC.PrevLineTextBaseOffset = 0.0f;
         window->DC.IsSameLine = window->DC.IsSetPos = false;
+        window->DC.RtlAlignedLineAnchorX = 0.0f;
 
         window->DC.NavLayerCurrent = ImGuiNavLayer_Main;
         window->DC.NavLayersActiveMask = window->DC.NavLayersActiveMaskNext;
@@ -11758,6 +11759,7 @@ void ImGui::ItemSize(const ImVec2& size, float text_baseline_y)
     window->DC.PrevLineTextBaseOffset = ImMax(window->DC.CurrLineTextBaseOffset, text_baseline_y);
     window->DC.CurrLineTextBaseOffset = 0.0f;
     window->DC.IsSameLine = window->DC.IsSetPos = false;
+    window->DC.RtlAlignedLineAnchorX = 0.0f; // Any item ends the "next item continues an RTL line" state (covers NewLine(), which calls ItemSize()).
 
     // Horizontal layout mode
     if (window->DC.LayoutType == ImGuiLayoutType_Horizontal)
@@ -11770,6 +11772,36 @@ IM_MSVC_RUNTIME_CHECKS_RESTORE
 //      offset_from_start_x != 0 : align to specified x position (relative to window/group left)
 //      spacing_w < 0            : use default spacing if offset_from_start_x == 0, no spacing if offset_from_start_x != 0
 //      spacing_w >= 0           : enforce spacing amount
+#ifdef IMGUI_ENABLE_RTL
+// [Fork/RTL] Where does the item following a right-aligned text start?
+// TextEx() right-aligns a line-initial RTL text (drawn flush with the work area's right edge) while the
+// layout cursor advances left-to-right by the text's width. Continuing the line after the *logical*
+// advance would place the next widget past the label's left edge and paint over it. In RTL flow the
+// next item belongs to the LEFT of the aligned text instead.
+// SameLine() cannot know the next item's size, so we split it two ways:
+//  - if the caller already set an explicit positive width (SetNextItemWidth), we know it and can place
+//    the item so its right edge lands one spacing left of the aligned text;
+//  - otherwise we start the item at the line's left edge and clamp its width to the remaining space,
+//    so a default-width widget (InputText, Slider, Combo, ...) fills up to the label without covering it.
+// Items that ignore the item width (Button, Text, ...) simply start at the left edge.
+static float ImGuiRtlAlignNextItemOnLine(ImGuiContext& g, ImGuiWindow* window, float default_x, float spacing_w)
+{
+    const float anchor_x = window->DC.RtlAlignedLineAnchorX;
+    if (anchor_x <= 0.0f)
+        return default_x;
+
+    const float line_start_x = window->Pos.x - window->Scroll.x + window->DC.Indent.x + window->DC.ColumnsOffset.x;
+    const float avail = anchor_x - spacing_w - line_start_x;
+    const float explicit_width = (g.NextItemData.HasFlags & ImGuiNextItemDataFlags_HasWidth) ? g.NextItemData.Width : 0.0f;
+    if (explicit_width > 0.0f)
+        return IM_TRUNC(anchor_x - spacing_w - explicit_width);
+
+    g.NextItemData.HasFlags |= ImGuiNextItemDataFlags_HasWidth; // Consumed by the next item's ItemAdd().
+    g.NextItemData.Width = IM_TRUNC(ImMax(1.0f, avail));
+    return IM_TRUNC(line_start_x);
+}
+#endif
+
 void ImGui::SameLine(float offset_from_start_x, float spacing_w)
 {
     ImGuiContext& g = *GImGui;
@@ -11788,9 +11820,14 @@ void ImGui::SameLine(float offset_from_start_x, float spacing_w)
     {
         if (spacing_w < 0.0f)
             spacing_w = g.Style.ItemSpacing.x;
-        window->DC.CursorPos.x = window->DC.CursorPosPrevLine.x + spacing_w;
+        float next_x = window->DC.CursorPosPrevLine.x + spacing_w;
+#ifdef IMGUI_ENABLE_RTL
+        next_x = ImGuiRtlAlignNextItemOnLine(g, window, next_x, spacing_w);
+#endif
+        window->DC.CursorPos.x = next_x;
         window->DC.CursorPos.y = window->DC.CursorPosPrevLine.y;
     }
+    window->DC.RtlAlignedLineAnchorX = 0.0f; // One-shot: only the item immediately following the aligned text is redirected.
     window->DC.CurrLineSize = window->DC.PrevLineSize;
     window->DC.CurrLineTextBaseOffset = window->DC.PrevLineTextBaseOffset;
     window->DC.IsSameLine = true;

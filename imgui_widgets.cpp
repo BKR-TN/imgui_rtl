@@ -193,14 +193,25 @@ void ImGui::TextEx(const char* text, const char* text_end, ImGuiTextFlags flags)
         // place, otherwise it would be pushed to the right edge and overlap its neighbours.
         ImVec2 text_pos_aligned = text_pos;
 #ifdef IMGUI_ENABLE_RTL
+        bool rtl_right_aligned = false;
         if (!wrap_enabled && !window->DC.IsSameLine)
+        {
             text_pos_aligned.x = ImGuiRTL::AlignTextRight(text_pos.x, window->WorkRect.Max.x, text_begin, text_end, text_size.x);
+            rtl_right_aligned = (text_pos_aligned.x > text_pos.x);
+        }
 #endif
 
         ImRect bb(text_pos_aligned, text_pos_aligned + text_size);
         ItemSize(text_size, 0.0f);
         if (!ItemAdd(bb, 0))
             return;
+
+#ifdef IMGUI_ENABLE_RTL
+        // Tell a following SameLine() where this right-aligned text starts, so the rest of the line is
+        // laid out to its left instead of on top of it. Set *after* ItemSize(), which clears the field.
+        if (rtl_right_aligned)
+            window->DC.RtlAlignedLineAnchorX = bb.Min.x;
+#endif
 
         // Render (we don't hide text after ## in this end-user function)
         RenderTextWrapped(bb.Min, text_begin, text_end, wrap_width);

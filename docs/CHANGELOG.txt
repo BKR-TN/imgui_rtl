@@ -110,6 +110,13 @@ Other Changes:
     the FreeType loader switches to `FT_SIZE_REQUEST_TYPE_NOMINAL` for that flag, so the shaper now
     mirrors it per source instead of always requesting `REAL_DIM` (previously a ~4.8px per glyph
     metric disagreement, i.e. the "gaps" bug, for e.g. Noto Naskh Arabic at 23px).
+  - [FORK/RTL] Fixed `SameLine()` after a right-aligned RTL label: the next widget was placed at
+    the label's logical (left-to-right) advance while the label was *drawn* flush-right, so the
+    widget painted over it (measured 24px overlap at a 400px window). The line now continues to
+    the left of the aligned text: a default-width widget fills up to one `ItemSpacing` short of
+    it, and a widget with an explicit `SetNextItemWidth()` is placed so its right edge lands
+    there. `SameLine(offset)` with an explicit offset keeps its absolute meaning; LTR text,
+    non-text items, wrapped text and non-RTL builds are unchanged.
   - [FORK/RTL] Support 24-bit font glyph indices: `IM_FONTGLYPH_ID_MAX` raised from
     `0xFFFF` to `0xFFFFFF`, since ISO OFF (5th edition) allows 24-bit indices and HarfBuzz
     15.0.0 enables beyond-64K glyph support by default. The glyph-id lookup is now two-tier

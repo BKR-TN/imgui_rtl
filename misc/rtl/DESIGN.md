@@ -767,6 +767,55 @@ if (base_direction == RTL && container_width > text_width)
 
 wrapped in `ImGuiRTL::AlignTextRight(pos_x, max_x, text, text_end, text_width)`.
 
+### Continuing the line after right-aligned text (`SameLine()`)
+
+Block-level alignment moves the drawn text but not the layout cursor, which advances
+left-to-right by the text's width (`ItemSize()` uses the logical position). A row written
+the ordinary way
+
+```cpp
+ImGui::Text("%s", "اسم المستخدم:");   // right-aligned to the work-rect right edge
+ImGui::SameLine();
+ImGui::InputText("##user", buf, sizeof(buf));
+```
+
+would therefore start the input at the label's *logical* end, far to the left of the drawn
+label, and the input — which then extends rightwards — paints over it. Measured at a 400px
+window: label `[342..412]`, input `[106..366]`, i.e. a 24px overlap.
+
+The hard part is that `SameLine()` runs **before** the next item's size is known, while every
+widget computes its rect (and draws) from the current cursor position, in its own order
+(`Button` captures the position *before* computing its size, `InputText` *after*). There is no
+single interception point inside the widgets, and deferring the placement until the size is
+known would mean re-drawing an already-emitted item.
+
+So the continuation is resolved in `SameLine()` with the two pieces of information available
+there, and the item is steered into the space left of the label:
+
+- `TextEx()` records the aligned text's left edge in
+  `ImGuiWindowTempData::RtlAlignedLineAnchorX` (after `ItemSize()`, which clears the field).
+- `SameLine(offset_from_start_x == 0)` consumes it:
+  - if the caller set an explicit positive item width (`SetNextItemWidth`), we know the width,
+    so the item is placed at `anchor - spacing - width` and hugs the label;
+  - otherwise the item starts at the line's left edge and its width is clamped through
+    `g.NextItemData` to `anchor - spacing - line_start` (consumed by that item's `ItemAdd()`),
+    so a default-width widget fills the whole space up to the label and stops one spacing short.
+  - widgets that ignore the item width (`Button`, `Text`, …) simply start at the left edge.
+- `SameLine()` clears the anchor unconditionally (it is one-shot), `ItemSize()` clears it on any
+  new item — which covers `NewLine()` — and `Begin()` clears it per frame, so state cannot leak
+  between rows or frames.
+- `SameLine(offset_from_start_x != 0)` is untouched: an explicit offset stays absolute from the
+  line start regardless of the previous item's direction.
+
+Two consequences worth knowing:
+
+- The continuation is laid out **right-to-left from the label**, so the field does not
+  necessarily start at the same x as the label's left edge minus its own width; it fills the
+  available space. If you need exact hugging, set the width explicitly (`SetNextItemWidth`)
+  and it will be placed at `anchor - spacing - width`.
+- A widget that does not use `CalcItemWidth()` and is wider than the remaining space can still
+  overflow into the label; the width clamp only applies to width-honouring widgets.
+
 ### Two levels of alignment
 
 - **Block-level** (single-line): shift the whole block so its right edge is at the
@@ -1005,8 +1054,10 @@ reasoning behind each guard is not lost:
 ### Verification
 
 `examples/rtl_demo/selftest.cpp` is the regression suite: it dumps the shaped output and runs
-43 checks covering all of the above (glyph-index bounds and caching, the 24-bit index cap and
-the dense-tier allocation guard, password masking and its caret geometry plus mask uniformity,
+54 checks covering all of the above (glyph-index bounds and caching, the 24-bit index cap and
+the dense-tier allocation guard, `SameLine()` continuation after right-aligned text at two window
+widths plus its LTR/explicit-offset/state-leak cases, password masking and its caret geometry plus
+mask uniformity,
 transient failures, wrap boundaries/flags/phantom lines, class-B characters, Home/End/Up/Down on
 shaped visual lines, `FontDestroyed` notifications, font removal + re-add, `GlyphExtraAdvanceX` on
 shaped text, shaper/loader metric agreement under both `Bitmap` settings, plus a

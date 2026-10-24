@@ -1080,6 +1080,124 @@ int main(int argc, char** argv)
         iom.Fonts->Build();
     }
 
+    // (12) RTL line continuation: `Text(RTL label); SameLine(); <widget>;` must place the widget to
+    // the LEFT of the right-aligned label instead of on top of it. Regression test for SameLine()
+    // advancing by the text's logical (LTR) width while TextEx() drew the text flush-right, which made
+    // the following widget paint over the label (17px overlap at a 400px window width before the fix).
+    {
+        ImGui::DestroyContext();
+        ImGui::CreateContext();
+        ImGuiIO& ios = ImGui::GetIO();
+        ios.DisplaySize = ImVec2(1000, 700);
+        ImFontConfig cfgs;
+        cfgs.OversampleH = cfgs.OversampleV = 1;
+        ImFont* fs = ios.Fonts->AddFontFromFileTTF(font_path, 22.0f, &cfgs);
+        ios.Fonts->Build();
+        if (fs != NULL && ios.Fonts->FontShaper != NULL)
+        {
+            static char buf[64] = "";
+            const char* label_rtl = "\xD8\xA7\xD8\xB3\xD9\x85 \xD8\xA7\xD9\x84\xD9\x85\xD8\xB3\xD8\xAA\xD8\xAE\xD8\xAF\xD9\x85:"; // "اسم المستخدم:"
+            const char* label_ltr = "Username:";
+            const float spacing = ImGui::GetStyle().ItemSpacing.x;
+
+            // Two widths: a roomy one, and a narrow one where the widget has to be clamped/shrunk.
+            for (int frame = 0; frame < 2; frame++)
+            {
+                const float win_w = (frame == 0) ? 776.0f : 400.0f;
+                ImGui::NewFrame();
+                ImGui::SetNextWindowPos(ImVec2(20, 20));
+                ImGui::SetNextWindowSize(ImVec2(win_w, 340));
+                ImGui::Begin("##rtl_sameline", NULL, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar |
+                                                   ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+                const float win_x = ImGui::GetWindowPos().x;
+                const float work_min_x = ImGui::GetCurrentWindow()->WorkRect.Min.x;
+                char det[256];
+                const char* width_tag = (frame == 0) ? "760px content" : "400px window";
+
+                // (1) RTL label followed by a widget: the widget goes to the left, one spacing away.
+                ImGui::Text("%s", label_rtl);
+                const ImVec2 a_min = ImGui::GetItemRectMin(), a_max = ImGui::GetItemRectMax();
+                ImGui::SameLine();
+                ImGui::InputText("##u", buf, sizeof(buf));
+                const ImVec2 b_min = ImGui::GetItemRectMin(), b_max = ImGui::GetItemRectMax();
+                snprintf(det, sizeof(det), "%s: label=[%.1f..%.1f] input=[%.1f..%.1f] gap=%.1f",
+                         width_tag, a_min.x, a_max.x, b_min.x, b_max.x, a_min.x - b_max.x);
+                // Guard: make sure the label really was right-aligned, otherwise "no overlap" is trivial.
+                // b_min.x is also asserted to be the content's left edge: a default-width widget starts
+                // there, which is what makes this row catch the bug at a wide window too (at 760px the
+                // old placement merely left a gap instead of overlapping the label).
+                const bool label_aligned = (a_min.x > work_min_x + 0.5f);
+                Check(label_aligned && b_max.x <= a_min.x - spacing + 0.5f && b_min.x < a_min.x &&
+                      b_min.x <= work_min_x + 0.5f,
+                      "SameLine() after an RTL label places the next widget to its left (no overlap)", det);
+
+                // (2) LTR label: unchanged, widget follows on the right.
+                ImGui::Text("%s", label_ltr);
+                const ImVec2 c_min = ImGui::GetItemRectMin(), c_max = ImGui::GetItemRectMax();
+                ImGui::SameLine();
+                ImGui::InputText("##l", buf, sizeof(buf));
+                const ImVec2 d_min = ImGui::GetItemRectMin(), d_max = ImGui::GetItemRectMax();
+                snprintf(det, sizeof(det), "%s: label=[%.1f..%.1f] input=[%.1f..%.1f]",
+                         width_tag, c_min.x, c_max.x, d_min.x, d_max.x);
+                Check(c_min.x <= work_min_x + 0.5f && d_min.x >= c_max.x - 0.5f,
+                      "SameLine() after an LTR label is unchanged (widget on the right)", det);
+
+                // (3) An explicit SameLine(offset) keeps its absolute-from-line-start meaning.
+                ImGui::Text("%s", label_rtl);
+                ImGui::SameLine(100.0f);
+                ImGui::Button("B");
+                const ImVec2 e_min = ImGui::GetItemRectMin();
+                snprintf(det, sizeof(det), "%s: explicit offset -> x=%.1f (expected %.1f)",
+                         width_tag, e_min.x - win_x, 100.0);
+                Check(ImFabs((e_min.x - win_x) - 100.0f) < 0.5f,
+                      "SameLine(explicit offset) after an RTL label keeps its absolute offset", det);
+
+                // (4) A widget that ignores the item width (Button) still goes to the left.
+                ImGui::Text("%s", label_rtl);
+                const ImVec2 f_min = ImGui::GetItemRectMin(), f_max = ImGui::GetItemRectMax();
+                ImGui::SameLine();
+                ImGui::Button("OK");
+                const ImVec2 g_min = ImGui::GetItemRectMin(), g_max = ImGui::GetItemRectMax();
+                snprintf(det, sizeof(det), "%s: label=[%.1f..%.1f] button=[%.1f..%.1f]",
+                         width_tag, f_min.x, f_max.x, g_min.x, g_max.x);
+                Check(g_max.x <= f_min.x - spacing + 0.5f && g_min.x < f_min.x,
+                      "SameLine() after an RTL label places a Button to its left", det);
+
+                // (5) Narrow window: the widget is clamped to the content's left edge and shrunk to the
+                // space left of the label (documented behaviour: shrink, never clamp to a negative width).
+                if (frame == 1)
+                {
+                    snprintf(det, sizeof(det), "input=[%.1f..%.1f] content left=%.1f label left=%.1f",
+                             b_min.x, b_max.x, work_min_x, a_min.x);
+                    Check(ImFabs(b_min.x - work_min_x) < 0.5f && b_max.x <= a_min.x - spacing + 0.5f,
+                          "narrow window: the continuation widget starts at the content's left edge", det);
+                }
+
+                // (6) The state must not leak: SameLine() after a non-text item is plain LTR flow.
+                ImGui::Dummy(ImVec2(20.0f, 10.0f));
+                const ImVec2 i_max = ImGui::GetItemRectMax();
+                ImGui::SameLine();
+                ImGui::Button("Z");
+                const ImVec2 j_min = ImGui::GetItemRectMin();
+                snprintf(det, sizeof(det), "%s: dummy right=%.1f button left=%.1f expected=%.1f",
+                         width_tag, i_max.x, j_min.x, i_max.x + spacing);
+                Check(ImFabs(j_min.x - (i_max.x + spacing)) < 0.5f,
+                      "SameLine() after a non-text item is unaffected (no leaked RTL state)", det);
+
+                ImGui::End();
+                ImGui::Render();
+            }
+        }
+        ImGui::DestroyContext();
+        ImGui::CreateContext();
+        ImGuiIO& iom2 = ImGui::GetIO();
+        iom2.DisplaySize = ImVec2(640, 480);
+        ImFontConfig cfgm2;
+        cfgm2.OversampleH = cfgm2.OversampleV = 1;
+        iom2.Fonts->AddFontFromFileTTF(font_path, 22.0f, &cfgm2);
+        iom2.Fonts->Build();
+    }
+
     printf("\n=== Regression tests: %d/%d passed ===\n", GTestCount - GTestFailures, GTestCount);
     ImGui::DestroyContext();
     return (GTestFailures == 0) ? 0 : 1;

@@ -2741,6 +2741,7 @@ struct IMGUI_API ImGuiWindowTempData
     float                   PrevLineTextBaseOffset;
     bool                    IsSameLine;
     bool                    IsSetPos;
+    float                   RtlAlignedLineAnchorX;   // [Fork/RTL] Left edge of a right-aligned line-initial text (0.0f = none). Set by TextEx(), consumed by SameLine() so the line continues to the LEFT of the aligned text; cleared by ItemSize() and Begin().
     ImVec1                  Indent;                 // Indentation / start position from left of window (increased by TreePush/TreePop, etc.)
     ImVec1                  ColumnsOffset;          // Offset to the current column (if ColumnsCurrent > 0). FIXME: This and the above should be a stack to allow use cases like Tree->Column->Tree. Need revamp columns API.
     ImVec1                  GroupOffset;
